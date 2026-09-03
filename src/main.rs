@@ -51,8 +51,31 @@ impl Grid {
     }
 
     fn set_line(&mut self, start: Vec2, end: Vec2, to: State) {
-        // TODO: actual raycast impl
-        self.set(end.round().as_ivec2(), to);
+        // I had AI do this but it's like a really common algorithm
+        let mut cell = start.round().as_ivec2();
+        let end = end.round().as_ivec2();
+        let delta = (end - cell).abs();
+        let step = (end - cell).signum();
+        let mut error = delta.x - delta.y;
+
+        loop {
+            if cell.cmpge(IVec2::ZERO).all() && cell.cmplt(IVec2::splat(SIZE as i32)).all() {
+                self.set(cell, to);
+            }
+            if cell == end {
+                break;
+            }
+
+            let twice_error = 2 * error;
+            if twice_error > -delta.y {
+                error -= delta.y;
+                cell.x += step.x;
+            }
+            if twice_error < delta.x {
+                error += delta.x;
+                cell.y += step.y;
+            }
+        }
     }
 }
 
