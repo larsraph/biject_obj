@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = { version = "0.19.1", default-features = false, features = ["2d", "ui", "audio", "dynamic_linking"] }
+bevy = { version = "0.19.1", default-features = false, features = ["2d", "ui", "audio", "dynamic_linking", "debug"] }
 ndshape = "0.3.0"
 
 [profile.dev]
