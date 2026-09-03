@@ -14,7 +14,7 @@ fn main() {
         }))
         .init_resource::<QuadTemplate>()
         .add_systems(Startup, setup)
-        .add_systems(Update, sync_grid)
+        .add_systems(Update, (input, sync_grid).chain())
         .run();
 }
 
@@ -25,15 +25,34 @@ type Shape = ConstPow2Shape2usize<SIZE_LOG2, SIZE_LOG2>;
 
 #[derive(Component)]
 struct Grid {
-    exists: [bool; SIZE_POW2],
+    state: [State; SIZE_POW2],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State {
+    Set,
+    Unset,
 }
 
 impl Grid {
     fn iter_set_positions(&self) -> impl Iterator<Item = IVec2> + '_ {
         (0..SIZE)
             .flat_map(|y| (0..SIZE).map(move |x| USizeVec2::new(x, y)))
-            .filter(|pos| self.exists[Shape::linearize(pos.to_array())])
+            .filter(|pos| matches!(self.state[Shape::linearize(pos.to_array())], State::Set))
             .map(|pos| pos.as_ivec2())
+    }
+
+    fn set(&mut self, pos: IVec2, to: State) {
+        assert!(pos.cmpge(IVec2::ZERO).all());
+        assert!(pos.cmplt(IVec2::splat(SIZE as i32)).all());
+        let pos = pos.as_usizevec2();
+        let index = Shape::linearize(pos.to_array());
+        self.state[index] = to;
+    }
+
+    fn set_line(&mut self, start: Vec2, end: Vec2, to: State) {
+        // TODO: actual raycast impl
+        self.set(end.round().as_ivec2(), to);
     }
 }
 
@@ -61,15 +80,15 @@ struct Quad;
 
 fn setup(mut commands: Commands) {
     let mut grid = Grid {
-        exists: [false; SIZE_POW2],
+        state: [State::Unset; SIZE_POW2],
     };
     // debug positions for now
-    grid.exists[25] = true;
-    grid.exists[25 + SIZE] = true;
-    grid.exists[14298] = true;
-    grid.exists[14299] = true;
-    grid.exists[14300] = true;
-    grid.exists[14301] = true;
+    grid.state[25] = State::Set;
+    grid.state[25 + SIZE] = State::Set;
+    grid.state[14298] = State::Set;
+    grid.state[14299] = State::Set;
+    grid.state[14300] = State::Set;
+    grid.state[14301] = State::Set;
     commands.spawn(grid);
 
     commands.spawn((
@@ -91,24 +110,67 @@ fn sync_grid(
     grid: Single<&Grid>,
     template: Res<QuadTemplate>,
 ) {
-    let mut new = grid.iter_set_positions();
     let mut recycle = quads.iter_mut();
-
-    for (pos, (_, mut re_trgt)) in (&mut new).zip(&mut recycle) {
-        re_trgt.translation = pos.extend(0).as_vec3();
+    for pos in grid.iter_set_positions() {
+        if let Some((_, mut re_trgt)) = recycle.next() {
+            re_trgt.translation = pos.extend(0).as_vec3();
+        } else {
+            commands.spawn((
+                Quad,
+                Transform::from_translation(pos.extend(0).as_vec3()),
+                template.0.clone(),
+            ));
+        }
     }
 
-    // We either despawn to set inactive. Despawning is better unless you
-    // have non-copy or persistent data.
+    // We either despawn or set `Disabled`.
+    // Despawning is better unless you have non-copy or persistent data
+    // because it doesn't perform an archetype move.
     for (e, _) in recycle {
         commands.entity(e).despawn();
     }
+}
 
-    for pos in new {
-        commands.spawn((
-            Quad,
-            Transform::from_translation(pos.extend(0).as_vec3()),
-            template.0.clone(),
-        ));
+fn input(
+    window: Single<&Window>,
+    camera: Single<(&Camera, &GlobalTransform)>,
+    mut grid: Single<&mut Grid>,
+    mbi: Res<ButtonInput<MouseButton>>,
+    mut last: Local<Option<(State, Vec2)>>,
+) -> Result<(), BevyError> {
+    let lmb = mbi.pressed(MouseButton::Left);
+    let rmb = mbi.pressed(MouseButton::Right);
+
+    if !lmb && !rmb {
+        *last = None;
+        return Ok(());
     }
+
+    let (camera, camera_transform) = camera.into_inner();
+    if let Some(cursor_position) = window.cursor_position() {
+        let pos = camera
+            .viewport_to_world_2d(camera_transform, cursor_position)
+            .with_severity(Severity::Warning)?;
+
+        if let Some((mode, lpos)) = &mut *last {
+            // Swap the mode if neccecary
+            match (lmb, rmb, *mode) {
+                (true, false, State::Unset) => *mode = State::Set,
+                (false, true, State::Set) => *mode = State::Unset,
+                _ => {}
+            }
+
+            grid.set_line(*lpos, pos, *mode);
+
+            *lpos = pos;
+        } else {
+            // prioritize LMB
+            // because lmb == false and lmb || rmb == true then rmb == true
+            let mode = if lmb { State::Set } else { State::Unset };
+            *last = Some((mode, pos));
+
+            grid.set(pos.round().as_ivec2(), mode)
+        }
+    };
+    Ok(())
 }
