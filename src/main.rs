@@ -1,6 +1,8 @@
 use bevy::{camera::ScalingMode, math::USizeVec2, prelude::*};
 use ndshape::{ConstPow2Shape2usize, ConstShape as _};
 
+mod projection;
+
 const PX_PER_CELL: u32 = 4;
 
 fn main() {
