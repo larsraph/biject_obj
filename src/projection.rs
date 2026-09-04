@@ -7,110 +7,136 @@
 //!
 //! I'm currently using `sparse_linear_assignment` to solve this which has bad documentation and
 //! is not idiomatic rust... it should work it's just ugly as hell.
-use std::iter;
 
-use bevy::{platform::collections::HashMap, prelude::*};
-use ndshape::{AbstractShape, RuntimeShape};
+use bevy::prelude::*;
+use ndshape::{RuntimeShape, Shape};
 use sparse_linear_assignment::{AuctionSolution, AuctionSolver, KhoslaSolver};
 
-use crate::Grid;
+pub struct DenseGrid<T> {
+    pub data: Vec<T>,
+    /// TODO: `data.len` is duped in `shape.size`
+    /// TODO: fast division in delinearization
+    pub shape: RuntimeShape<u32, 2>,
+}
 
-struct BodyGrid {}
-
-impl BodyGrid {
-    fn iter_lin_delin_pos(&self) -> impl Iterator<Item = (usize, IVec2)> + '_ {
-        iter::empty()
-    }
-
-    fn num_cells(&self) -> usize {
-        0
+impl<T> DenseGrid<T> {
+    pub fn new(dims: UVec2, fill: T) -> Self
+    where
+        T: Clone,
+    {
+        let shape = RuntimeShape::<u32, 2>::new(dims.to_array());
+        let data = vec![fill; shape.usize()];
+        Self { shape, data }
     }
 }
 
 /// The `target` must have no Transform OR we project the body into the target space (currently assuming target space == world space)
-fn solve(
-    body: &BodyGrid,
-    body_transform: &GlobalTransform,
-    shape: RuntimeShape<u32, 2>,
-) -> Solution {
+fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3) -> Solution {
+    let [x, y] = src_shape.as_array();
+
+    let mut min = IVec2::MIN;
+    let mut max = IVec2::MAX;
+    for y in [0, y] {
+        for x in [0, x] {
+            let corner = UVec2::new(x, y);
+            let point = corner.as_vec2();
+            let w_pos = transform_point(rotation, translation, point);
+            // bilinear() is pretty cheap but I think there should be a way to use
+            // which corner we're looking at + the rotation to quickly figure out
+            // which bilinear corner is the one that matters
+            for pos in bilinear(w_pos) {
+                min = min.min(pos);
+                max = max.max(pos);
+            }
+        }
+    }
+    let trgt_origin = min;
+    let trgt_size = (max - min).as_uvec2();
+    let trgt_shape = RuntimeShape::<u32, 2>::new(trgt_size.to_array());
+
     let (mut solver, mut solution) = KhoslaSolver::<u32>::new(0, 0, 0);
 
-    // The target is infinite but we will have at least the number of columns
-    let num_rows = body.num_cells() as u32;
-    solver.init(num_rows, num_rows).unwrap();
+    let num_rows = src_shape.size();
+    let num_cols = trgt_shape.size();
+    solver
+        .init(num_rows, num_cols)
+        // this shouldn't be an error in the first place because it just improves alloc perf not correctness
+        .expect("the projected AABB-similar shape is always >= the source shape");
 
-    // instead of handling this sparse mapping we could use direct indexing on `target`, although
-    // it's infinite we *do* know that only a subset of it is targetable, so we could create
-    // a direct addressing sub-grid that delinearizes instead of doing a table lookup.
-    let mut col_to_trgt = Vec::new();
-    let mut trgt_to_col = HashMap::new();
-
-    for (row, pos) in body.iter_lin_delin_pos() {
-        let w_pos = body_transform
-            .transform_point(pos.as_vec2().extend(0.))
-            .xy();
-        let bilinear = bilinear(w_pos);
-        let columns = bilinear.map(|bpos| {
-            trgt_to_col.get(&bpos).copied().unwrap_or_else(|| {
-                let col = col_to_trgt.len() as u32;
-                col_to_trgt.push(bpos);
-                trgt_to_col.insert(bpos, col);
-                col
-            })
-        });
-        let values = bilinear.map(|bpos| bpos.as_vec2().distance_squared(w_pos) as f64);
+    for (idx, pos) in iter_tuple_idx_pos(&src_shape) {
+        let point = pos.as_vec2();
+        let w_point = transform_point(rotation, translation, point);
+        let bilinear = bilinear(w_point);
+        // columns should be ordered row major because bilinear samples are ordered row major
+        let columns =
+            bilinear.map(|w_pos| trgt_shape.linearize((w_pos - trgt_origin).as_uvec2().to_array()));
+        // I'm fairly certain correcting by 0.5 is the right thing to do here
+        // wait it's not unless I also correct by 0.5 before bilinear sampling, which is only correct
+        // if I render cells centered about their "position" which classically is not how it's done
+        let values = bilinear
+            .map(|w_pos| (w_pos.as_vec2() + Vec2::splat(0.5)).distance_squared(w_point) as f64);
         solver
-            .extend_from_values(row as u32, &columns, &values)
-            .unwrap();
+            .extend_from_values(idx, &columns, &values)
+            .expect("this crate keeps giving `anyhow::Error`... anyway this function wont fail");
     }
 
     solver.solve(&mut solution, false, None).unwrap();
 
     Solution {
-        shape,
-        auct_solution: solution,
-        col_to_trgt,
-        trgt_to_col,
+        solution,
+        src_shape,
+        trgt_shape,
+        trgt_origin,
     }
 }
 
 struct Solution {
-    shape: RuntimeShape<u32, 2>,
-    auct_solution: AuctionSolution<u32>,
-    // It will be far fewer lookups, although probably more memory, to have this
-    // mapping be direct indexing
-    col_to_trgt: Vec<IVec2>,
-    trgt_to_col: HashMap<IVec2, u32>,
+    solution: AuctionSolution<u32>,
+    src_shape: RuntimeShape<u32, 2>,
+    trgt_shape: RuntimeShape<u32, 2>,
+    trgt_origin: IVec2,
 }
 
 impl Solution {
-    /// Panicky RN
-    pub fn src_to_dst(&self, pos: UVec2) -> IVec2 {
-        let col =
-            self.auct_solution.person_to_object[self.shape.linearize(pos.to_array()) as usize];
-        self.col_to_trgt[col as usize]
+    pub fn src_to_dst(&self, pos: UVec2) -> Option<IVec2> {
+        let src_idx = self.src_shape.linearize(pos.to_array());
+        let dst_idx = *self.solution.person_to_object.get(src_idx as usize)?;
+        let local_pos = UVec2::from_array(self.trgt_shape.delinearize(dst_idx));
+        Some(local_pos.as_ivec2() + self.trgt_origin)
     }
 
-    /// Panicky RN
-    pub fn dst_to_src(&self, pos: IVec2) -> UVec2 {
-        let col = self.trgt_to_col[&pos];
-        let person = self.auct_solution.object_to_person[col as usize];
-        self.shape.delinearize(person).into()
+    pub fn dst_to_src(&self, pos: IVec2) -> Option<UVec2> {
+        let local_pos = (pos - self.trgt_origin).as_uvec2();
+        let dst_idx = self.trgt_shape.linearize(local_pos.to_array());
+        let src_idx = *self.solution.object_to_person.get(dst_idx as usize)?;
+        Some(UVec2::from_array(self.src_shape.delinearize(src_idx)))
     }
+}
+
+/// Doesn't include shear hence why i have an (almost) copy of a function
+#[inline]
+fn transform_point(rotation: Quat, translation: Vec3, point: Vec2) -> Vec2 {
+    let point = Vec3A::new(point.x, point.y, 0.);
+    let point = rotation * point;
+    let point = point + translation.to_vec3a();
+    point.xy()
+}
+
+#[inline]
+pub fn iter_tuple_idx_pos(shape: &RuntimeShape<u32, 2>) -> impl Iterator<Item = (u32, UVec2)> + '_ {
+    let [x, y] = shape.as_array();
+    (0..y).flat_map(move |y| (0..x).map(move |x| (shape.linearize([x, y]), UVec2::new(x, y))))
 }
 
 #[inline(always)]
 fn bilinear(vec: Vec2) -> [IVec2; 4] {
-    let Vec2 { x, y } = vec;
-    let x_floor = x.floor() as i32;
-    let y_floor = y.floor() as i32;
-    let x_ceil = x.ceil() as i32;
-    let y_ceil = y.ceil() as i32;
-
+    let floor = vec.floor();
+    let ceil = vec.ceil();
+    // Ordered row major asc
     [
-        IVec2::new(x_floor, y_floor),
-        IVec2::new(x_ceil, y_floor),
-        IVec2::new(x_floor, y_ceil),
-        IVec2::new(x_ceil, y_ceil),
+        floor.as_ivec2(),
+        Vec2::new(ceil.x, floor.y).as_ivec2(),
+        Vec2::new(floor.x, ceil.y).as_ivec2(),
+        ceil.as_ivec2(),
     ]
 }
