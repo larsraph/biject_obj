@@ -3487,8 +3487,7 @@ dependencies = [
 [[package]]
 name = "ndshape"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "975bce586ad637e27f6dc26ee907c07050686a588695bfd64b7873a9d48a700c"
+source = "git+https://github.com/larsraph/ndshape-rs#2eca8724d50f92cc7ad1c7f1a3e134a5e6f76105"
 dependencies = [
  "static_assertions",
 ]
