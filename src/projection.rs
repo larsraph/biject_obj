@@ -2,7 +2,7 @@ use bevy::prelude::*;
 use ndshape::{RuntimeShape, Shape as _};
 use sparse_linear_assignment::{AuctionSolver as _, KhoslaSolver};
 
-fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3A) -> Solution {
+pub fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3A) -> Solution {
     let [x, y] = src_shape.as_array();
 
     let mut min = IVec2::MAX;
@@ -40,7 +40,7 @@ fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3A) ->
         let bilinear = bilinear(w_point);
         let columns = bilinear.map(|w_pos| dst_shape.linearize((w_pos - dst_origin).as_uvec2()));
         let values = bilinear.map(|w_pos| w_pos.as_vec2().distance_squared(w_point) as f64);
-        // This expects row major ordering which is ensured by the `bilinear` function
+        // this expects row major ordering which is ensured by the `bilinear` function
         solver.extend_from_values(idx, &columns, &values).unwrap();
     }
 
@@ -56,7 +56,7 @@ fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3A) ->
     }
 }
 
-struct Solution {
+pub struct Solution {
     src_to_dst: Vec<u32>,
     dst_to_src: Vec<u32>,
     src_shape: RuntimeShape<u32, 2>,
@@ -65,7 +65,6 @@ struct Solution {
 }
 
 impl Solution {
-    // TODO: handle imperfect solutions
     pub fn src_to_dst(&self, pos: UVec2) -> Option<IVec2> {
         if !self.src_shape.contains(pos) {
             return None;
@@ -95,7 +94,7 @@ impl Solution {
 
 /// Copy of [`Transform::transform_point`] without scaling
 ///
-/// Using [`Vec3A`] vectors because we have to convert anyway.
+/// Using [`Vec3A`] vectors because we have to convert anyway
 #[inline]
 fn transform_point(rotation: Quat, translation: Vec3A, point: Vec2) -> Vec2 {
     let mut point = Vec3A::new(point.x, point.y, 0.);
@@ -114,7 +113,7 @@ pub fn iter_tuple_idx_pos(shape: &RuntimeShape<u32, 2>) -> impl Iterator<Item = 
 fn bilinear(mut vec: Vec2) -> [IVec2; 4] {
     let floor = vec.floor();
     let ceil = vec.ceil();
-    // Ordered row major ascending
+    // row major ordering
     [
         floor.as_ivec2(),
         Vec2::new(ceil.x, floor.y).as_ivec2(),
