@@ -104,7 +104,7 @@ fn transform_point(rotation: Quat, translation: Vec3A, point: Vec2) -> Vec2 {
 }
 
 #[inline]
-pub fn iter_tuple_idx_pos(shape: &RuntimeShape<u32, 2>) -> impl Iterator<Item = (u32, UVec2)> + '_ {
+fn iter_tuple_idx_pos(shape: &RuntimeShape<u32, 2>) -> impl Iterator<Item = (u32, UVec2)> + '_ {
     let [x, y] = shape.as_array();
     (0..y).flat_map(move |y| (0..x).map(move |x| (shape.linearize([x, y]), UVec2::new(x, y))))
 }

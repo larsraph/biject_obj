@@ -1,7 +1,11 @@
-use bevy::{camera::ScalingMode, math::USizeVec2, prelude::*};
-use ndshape::{ConstPow2Shape2usize, ConstShape as _};
+use bevy::{camera::ScalingMode, prelude::*};
 
+mod grid;
+mod octree;
 mod projection;
+
+use grid::*;
+use projection::*;
 
 const PX_PER_CELL: u32 = 4;
 
@@ -15,70 +19,10 @@ fn main() {
             ..default()
         }))
         .init_resource::<QuadTemplate>()
+        .init_resource::<WorldGrid>()
         .add_systems(Startup, setup)
-        .add_systems(Update, (input, sync_grid).chain())
+        .add_systems(Update, (input, render_grid).chain())
         .run();
-}
-
-const SIZE_LOG2: usize = 8;
-const SIZE: usize = 1 << SIZE_LOG2;
-const SIZE_POW2: usize = SIZE * SIZE;
-type Shape = ConstPow2Shape2usize<SIZE_LOG2, SIZE_LOG2>;
-
-#[derive(Component)]
-struct Grid {
-    state: [State; SIZE_POW2],
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum State {
-    Set,
-    Unset,
-}
-
-impl Grid {
-    fn iter_set_positions(&self) -> impl Iterator<Item = IVec2> + '_ {
-        (0..SIZE)
-            .flat_map(|y| (0..SIZE).map(move |x| USizeVec2::new(x, y)))
-            .filter(|pos| matches!(self.state[Shape::linearize(pos.to_array())], State::Set))
-            .map(|pos| pos.as_ivec2())
-    }
-
-    fn set(&mut self, pos: IVec2, to: State) {
-        assert!(pos.cmpge(IVec2::ZERO).all());
-        assert!(pos.cmplt(IVec2::splat(SIZE as i32)).all());
-        let pos = pos.as_usizevec2();
-        let index = Shape::linearize(pos.to_array());
-        self.state[index] = to;
-    }
-
-    fn set_line(&mut self, start: Vec2, end: Vec2, to: State) {
-        // I had AI do this but it's like a really common algorithm
-        let mut cell = start.round().as_ivec2();
-        let end = end.round().as_ivec2();
-        let delta = (end - cell).abs();
-        let step = (end - cell).signum();
-        let mut error = delta.x - delta.y;
-
-        loop {
-            if cell.cmpge(IVec2::ZERO).all() && cell.cmplt(IVec2::splat(SIZE as i32)).all() {
-                self.set(cell, to);
-            }
-            if cell == end {
-                break;
-            }
-
-            let twice_error = 2 * error;
-            if twice_error > -delta.y {
-                error -= delta.y;
-                cell.x += step.x;
-            }
-            if twice_error < delta.x {
-                error += delta.x;
-                cell.y += step.y;
-            }
-        }
-    }
 }
 
 #[derive(Bundle, Clone)]
@@ -104,18 +48,6 @@ struct QuadTemplate(QuadBundle);
 struct Quad;
 
 fn setup(mut commands: Commands) {
-    let mut grid = Grid {
-        state: [State::Unset; SIZE_POW2],
-    };
-    // debug positions for now
-    grid.state[25] = State::Set;
-    grid.state[25 + SIZE] = State::Set;
-    grid.state[14298] = State::Set;
-    grid.state[14299] = State::Set;
-    grid.state[14300] = State::Set;
-    grid.state[14301] = State::Set;
-    commands.spawn(grid);
-
     commands.spawn((
         Camera2d,
         Projection::Orthographic(OrthographicProjection {
@@ -129,14 +61,14 @@ fn setup(mut commands: Commands) {
     ));
 }
 
-fn sync_grid(
+fn render_grid(
     mut commands: Commands,
     mut quads: Query<(Entity, &mut Transform), With<Quad>>,
-    grid: Single<&Grid>,
+    w_grid: Res<WorldGrid>,
     template: Res<QuadTemplate>,
 ) {
     let mut recycle = quads.iter_mut();
-    for pos in grid.iter_set_positions() {
+    for pos in w_grid.iter_set_positions() {
         if let Some((_, mut re_trgt)) = recycle.next() {
             re_trgt.translation = pos.extend(0).as_vec3();
         } else {
@@ -159,9 +91,9 @@ fn sync_grid(
 fn input(
     window: Single<&Window>,
     camera: Single<(&Camera, &GlobalTransform)>,
-    mut grid: Single<&mut Grid>,
+    mut w_grid: ResMut<WorldGrid>,
     mbi: Res<ButtonInput<MouseButton>>,
-    mut last: Local<Option<(State, Vec2)>>,
+    mut last: Local<Option<(GCell, Vec2)>>,
 ) -> Result<(), BevyError> {
     let lmb = mbi.pressed(MouseButton::Left);
     let rmb = mbi.pressed(MouseButton::Right);
@@ -180,21 +112,21 @@ fn input(
         if let Some((mode, lpos)) = &mut *last {
             // Swap the mode if neccecary
             match (lmb, rmb, *mode) {
-                (true, false, State::Unset) => *mode = State::Set,
-                (false, true, State::Set) => *mode = State::Unset,
+                (true, false, GCell::Unset) => *mode = GCell::Set,
+                (false, true, GCell::Set) => *mode = GCell::Unset,
                 _ => {}
             }
 
-            grid.set_line(*lpos, pos, *mode);
+            w_grid.set_line(*lpos, pos, *mode);
 
             *lpos = pos;
         } else {
             // prioritize LMB
             // because lmb == false and lmb || rmb == true then rmb == true
-            let mode = if lmb { State::Set } else { State::Unset };
+            let mode = if lmb { GCell::Set } else { GCell::Unset };
             *last = Some((mode, pos));
 
-            grid.set(pos.round().as_ivec2(), mode)
+            w_grid.set(pos.round().as_ivec2(), mode)
         }
     };
     Ok(())
