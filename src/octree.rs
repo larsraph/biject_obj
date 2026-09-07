@@ -3,10 +3,61 @@ use bevy::{
     platform::collections::HashMap,
 };
 
+/// Manages persistent state when walking through a octree depth-first with
+/// depth `D` and no leaf data.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct Cursor {
+struct Cursor<const D: u32> {
     idx: u32,
     level: u32,
+}
+
+impl<const D: u32> Cursor<D> {
+    const fn root() -> Self {
+        Cursor { idx: 0, level: D }
+    }
+
+    fn octant(&self, pos: UVec3) -> u32 {
+        octant(pos, self.level)
+    }
+
+    fn next(mut self, oct: u32) -> Self {
+        self.level -= 1;
+        self.idx += 1 + oct * tree_len_no_leaves(self.level);
+        self
+    }
+
+    fn toward(self, pos: UVec3) -> Self {
+        self.next(octant(pos, self.level))
+    }
+
+    fn toward_level(mut self, pos: UVec3, level: u32) -> Self {
+        while self.level > level {
+            self = self.toward(pos);
+        }
+        self
+    }
+
+    fn prev(mut self, oct: u32) -> Self {
+        self.level += 1;
+        self.idx -= 1 + oct * tree_len_no_leaves(self.level);
+        self
+    }
+
+    fn away(self, pos: UVec3) -> Self {
+        self.prev(octant(pos, self.level))
+    }
+
+    fn is_root(&self) -> bool {
+        self.level == D
+    }
+
+    fn is_in_bounds(&self) -> bool {
+        self.level <= D
+    }
+
+    fn key(&self, pos: UVec3) -> Key {
+        Key::new(pos, self.level)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -22,41 +73,40 @@ impl<const D: u32> ChildrenInheritThis<D> {
         Self { vec }
     }
 
-    fn cursor() -> Cursor {
-        Cursor { idx: 0, level: D }
+    #[inline]
+    fn get_byte(&self, cursor: Cursor<D>) -> u8 {
+        self.vec[cursor.idx as usize]
     }
 
     #[inline]
-    fn walk_back_from(&self, pos: UVec3, level: u32) -> u32 {
-        let mut parent_idx = 0;
-        for level in (level + 1..=D - 1).rev() {
-            let oct = octant(pos, level);
-            let tree_len = tree_len_no_leaves(level);
-            parent_idx += 1 + oct * tree_len;
-        }
-
-        for level in level..=D - 1 {
-            let oct = octant(pos, level);
-            if !self.this_has_child(parent_idx, oct) {
-                return level;
-            }
-
-            if level == D - 1 {
-                break;
-            }
-
-            let parent_level = level + 1;
-            let parent_oct = octant(pos, parent_level);
-            let parent_tree_len = tree_len_no_leaves(parent_level);
-            parent_idx -= 1 + parent_oct * parent_tree_len;
-        }
-        // if no levels don't inherit return the root level
-        D
+    fn byte_mut(&mut self, cursor: Cursor<D>) -> &mut u8 {
+        &mut self.vec[cursor.idx as usize]
     }
 
-    fn this_has_child(&self, idx: u32, oct: u32) -> bool {
-        let byte = self.vec[idx as usize];
-        (byte >> oct) & 1 != 0
+    #[inline]
+    fn get(&self, cursor: Cursor<D>, oct: u32) -> bool {
+        (self.get_byte(cursor) >> oct) & 1 != 0
+    }
+
+    #[inline]
+    fn set(&mut self, cursor: Cursor<D>, value: bool, oct: u32) {
+        if value {
+            self.vec[cursor.idx as usize] |= 1 << oct;
+        } else {
+            self.vec[cursor.idx as usize] &= !(1 << oct);
+        }
+    }
+
+    #[inline]
+    fn scan_away(&self, mut cursor: Cursor<D>, pos: UVec3) -> Cursor<D> {
+        while cursor.is_in_bounds() {
+            if !self.get(cursor, cursor.octant(pos)) {
+                return cursor;
+            }
+
+            cursor = cursor.away(pos);
+        }
+        Cursor::root()
     }
 }
 
@@ -69,42 +119,45 @@ impl<const D: u32> ThisHasChildren<D> {
     #[inline]
     fn new() -> Self {
         let len = tree_len_no_leaves(D);
-        // the root is elided
         let len_no_root = len - 1;
-        // a octree with no root must have the number of nodes divisible by 8
         debug_assert_eq!(len_no_root % 8, 0);
         let byte_len = (len_no_root / 8) as usize;
         let vec = vec![0; byte_len];
         Self { vec }
     }
 
-    #[inline]
-    fn walk_towards(&self, pos: UVec3) -> u32 {
-        let mut idx = 0;
-        // The order is [D - 1, D - 2, ..., 1]. Level D is the root.
-        for level in (1..=(D - 1)).rev() {
-            let oct = octant(pos, level);
-            let tree_len = tree_len_no_leaves(level);
-            idx += oct * tree_len;
-
-            if !self.has_children(idx) {
-                return level;
-            }
-
-            // by adding 1 AFTER we query we don't get any funny business
-            // from the fact that idx 0 (aka the root) is omitted
-            idx += 1;
-        }
-        // if no levels didn't have children return level 0 the leaf level
-        0
-    }
-
-    #[inline]
-    fn has_children(&self, idx: u32) -> bool {
+    fn get(&self, cursor: Cursor<D>) -> bool {
+        debug_assert!(!cursor.is_root());
+        let idx = cursor.idx - 1;
         let byte_idx = idx / 8;
         let bit_idx = idx % 8;
         let byte = self.vec[byte_idx as usize];
         (byte >> bit_idx) & 1 != 0
+    }
+
+    fn set(&mut self, cursor: Cursor<D>, value: bool) {
+        debug_assert!(!cursor.is_root());
+        let idx = cursor.idx - 1;
+        let byte_idx = idx / 8;
+        let bit_idx = idx % 8;
+        let byte = &mut self.vec[byte_idx as usize];
+        if value {
+            *byte |= 1 << bit_idx;
+        } else {
+            *byte &= !(1 << bit_idx);
+        }
+    }
+
+    fn scan_towards_from_root(&self, pos: UVec3) -> Cursor<D> {
+        let mut cursor = Cursor::root();
+        cursor.toward(pos);
+        while cursor.level > 1 {
+            if !self.get(cursor) {
+                return cursor;
+            }
+            cursor = cursor.toward(pos);
+        }
+        cursor
     }
 }
 
@@ -115,11 +168,18 @@ struct Key {
 }
 
 impl Key {
-    #[inline]
     fn new(pos: UVec3, level: u32) -> Self {
         let level = level as u8;
         let pos = (pos >> level).as_u8vec3();
         Self { level, pos }
+    }
+
+    fn with_oct(mut self, oct: u32) -> Self {
+        self.pos &= !1;
+        self.pos.x |= (oct & 1) as u8;
+        self.pos.y |= ((oct >> 1) & 1) as u8;
+        self.pos.z |= ((oct >> 2) & 1) as u8;
+        self
     }
 }
 
@@ -157,13 +217,13 @@ impl<T: Copy + PartialEq, const D: u32> Octree<T, D> {
             return self.root;
         };
 
-        let level = inner.this_has_children.walk_towards(pos);
-        let level = inner.children_inherit_this.walk_back_from(pos, level);
+        let cursor = inner.this_has_children.scan_towards_from_root(pos);
+        let inheritee = inner.children_inherit_this.scan_away(cursor, pos);
 
-        if level == D {
+        if inheritee.is_root() {
             self.root
         } else {
-            *inner.values.get(&Key::new(pos, level)).unwrap()
+            *inner.values.get(&inheritee.key(pos)).unwrap()
         }
 
         // PSEUDO CODE
@@ -189,25 +249,119 @@ impl<T: Copy + PartialEq, const D: u32> Octree<T, D> {
             }
         };
 
-        let level = inner.this_has_children.walk_towards(pos);
-        if level == 0 {
-            let level = inner.children_inherit_this.walk_back_from(pos, level);
+        let cursor = inner.this_has_children.scan_towards_from_root(pos);
+        let c_oct = cursor.octant(pos);
+        let inheritee = inner.children_inherit_this.scan_away(cursor, pos);
 
-            let old_value = if level == D {
-                self.root
-            } else {
-                *inner.values.get(&Key::new(pos, level)).unwrap()
-            };
-            if old_value == value {
-                return;
-            }
-
-            let oct = octant(pos, level);
-            let parent_level;
-            if inner.children_inherit_this.get(parent_idx) == 1 << oct {
-                //
-            }
+        let old_value = if inheritee.is_root() {
+            self.root
+        } else {
+            *inner.values.get(&inheritee.key(pos)).unwrap()
+        };
+        if old_value == value {
+            return;
         }
+
+        if cursor.level == 0 {
+            let parent = cursor.away(pos);
+            let parent_byte = inner.children_inherit_this.get_byte(parent);
+
+            {
+                let mut ancestor = parent;
+                let mut cursor = cursor;
+                let mut oct = c_oct;
+                let mut ancestor_byte = parent_byte;
+                let mut commit = false;
+
+                loop {
+                    if ancestor_byte != 1 << oct {
+                        break;
+                    }
+                    commit = true;
+                    cursor = ancestor;
+                    ancestor = cursor.away(pos);
+                    oct = cursor.octant(pos);
+                    ancestor_byte = inner.children_inherit_this.get_byte(ancestor);
+
+                    // reevaluate children
+                    for oct in 0..8 {
+                        let cursor = ancestor.next(oct);
+                        let key = cursor.key(pos).with_oct(oct);
+
+                        let other_value = *inner.values.get(&key).unwrap();
+                        if value == other_value {
+                            inner.values.remove(&key);
+                            inner.children_inherit_this.set(cursor, true, oct);
+                        }
+                    }
+                }
+
+                if commit {
+                    if cursor.is_root() {
+                        self.root = value;
+                    } else {
+                        inner.values.insert(cursor.key(pos), value);
+                    }
+                    return;
+                }
+            }
+
+            let doesnt_inherit = (parent_byte >> c_oct) & 1 == 0;
+            if doesnt_inherit {
+                let parent_inheritee = inner.children_inherit_this.scan_away(parent, pos);
+                let parent_value = *inner.values.get(&parent_inheritee.key(pos)).unwrap();
+                if parent_value == value {
+                    inner.values.remove(&cursor.key(pos)).unwrap();
+
+                    *inner.children_inherit_this.byte_mut(parent) |= 1 << c_oct;
+
+                    let mut ancestor = parent;
+                    let mut anc_byte = parent_byte;
+
+                    loop {
+                        if anc_byte != !0u8 {
+                            break;
+                        }
+
+                        let mut any_have = false;
+                        for oct in 0..8 {
+                            let anc_child = ancestor.next(oct);
+                            any_have |= inner.this_has_children.get(anc_child);
+                        }
+                        if any_have {
+                            break;
+                        }
+
+                        if ancestor.is_root() {
+                            self.inner = None;
+                            return;
+                        } else {
+                            inner.this_has_children.set(ancestor, false);
+                        }
+
+                        ancestor = ancestor.away(pos);
+                        anc_byte = inner.children_inherit_this.get_byte(ancestor);
+                    }
+
+                    return;
+                }
+            }
+
+            inner.children_inherit_this.set(parent, false, c_oct);
+            inner.values.insert(cursor.key(pos), value);
+        } else {
+            let mut last = cursor;
+            let mut drill = cursor;
+            while drill.level != 0 {
+                inner.this_has_children.set(drill, true);
+                last = drill;
+                drill = drill.toward(pos);
+            }
+            inner.values.insert(cursor.key(pos), value);
+            let oct = drill.octant(pos);
+            inner.children_inherit_this.set(last, false, oct)
+        }
+
         // FIRST if we don't have any inner AND the value is the same as the root, do nothing
         //
         // if we don't have any inner and the value is NOT the same as the root create a new inner with default values
