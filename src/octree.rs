@@ -1,163 +1,109 @@
+use std::ops::{Index, IndexMut};
+
 use bevy::{
     math::{U8Vec3, UVec3},
     platform::collections::HashMap,
 };
 
-/// Manages persistent state when walking through a octree depth-first with
-/// depth `D` and no leaf data.
+/// Persistent walkable state for a depth-first octree. Incl
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct Cursor<const D: u32> {
-    idx: u32,
-    level: u32,
+struct Cursor {
+    index: u32,
+    /// The length of the tree with the depth equal to `level` excluding
+    /// any skipped levels.
+    tree_len: u32,
 }
 
-impl<const D: u32> Cursor<D> {
-    const fn root() -> Self {
-        Cursor { idx: 0, level: D }
+impl Cursor {
+    /// Returns the root cursor for an octree with the given depth,
+    /// skipping the last `skipped` levels.
+    const fn root<const DEPTH: u8>(skipped: u8) -> Self {
+        Cursor {
+            index: 0,
+            tree_len: tree_len(DEPTH - skipped),
+            level: DEPTH,
+        }
     }
 
-    fn octant(&self, pos: UVec3) -> u32 {
-        octant(pos, self.level)
+    const fn is_root<const DEPTH: u8>(self) -> bool {
+        self.level == DEPTH
     }
 
-    fn next(mut self, oct: u32) -> Self {
+    const fn is_valid<const DEPTH: u8>(self) -> bool {
+        self.level <= DEPTH
+    }
+
+    const fn is_leaf(self) -> bool {
+        self.level == 0
+    }
+
+    const fn _descend1(&mut self) {
         self.level -= 1;
-        self.idx += 1 + oct * tree_len_no_leaves(self.level);
-        self
+        self.tree_len = (self.tree_len - 1) / 8;
     }
 
-    fn toward(self, pos: UVec3) -> Self {
-        self.next(octant(pos, self.level))
+    const fn _descend2(&mut self, oct: u32) {
+        self.index += 1 + oct * self.tree_len;
     }
 
-    fn toward_level(mut self, pos: UVec3, level: u32) -> Self {
-        while self.level > level {
-            self = self.toward(pos);
-        }
-        self
+    const fn descend(&mut self, oct: u32) {
+        self._descend1();
+        self._descend2(oct);
     }
 
-    fn prev(mut self, oct: u32) -> Self {
+    fn descend_with(&mut self, pos: UVec3) {
+        self._descend1();
+        let oct = octant(pos, self.level);
+        self._descend2(oct);
+    }
+
+    const fn ascend(&mut self, oct: u32) {
+        self.index -= 1 + oct * self.tree_len;
         self.level += 1;
-        self.idx -= 1 + oct * tree_len_no_leaves(self.level);
+        self.tree_len = (self.tree_len * 8) + 1;
+    }
+
+    fn ascend_with(&mut self, pos: UVec3) {
+        let oct = octant(pos, self.level);
+        self.ascend(oct);
+    }
+
+    fn ascended_with(mut self, pos: UVec3) -> Self {
+        self.ascend_with(pos);
         self
     }
 
-    fn away(self, pos: UVec3) -> Self {
-        self.prev(octant(pos, self.level))
-    }
-
-    fn is_root(&self) -> bool {
-        self.level == D
-    }
-
-    fn is_in_bounds(&self) -> bool {
-        self.level <= D
-    }
-
-    fn key(&self, pos: UVec3) -> Key {
-        Key::new(pos, self.level)
+    fn descended_with(mut self, pos: UVec3) -> Self {
+        self.descend_with(pos);
+        self
     }
 }
 
+/// A complete tree storing a byte per node indexed by a [`Cursor`]
 #[derive(Clone, Debug)]
-struct ChildrenInheritThis<const D: u32> {
+struct CompleteByteTree {
     vec: Vec<u8>,
 }
 
-impl<const D: u32> ChildrenInheritThis<D> {
-    #[inline]
-    fn new() -> Self {
-        let len = tree_len_no_leaves(D);
-        let vec = vec![0; len as usize];
+impl CompleteByteTree {
+    fn new(depth: u8, fill: u8) -> Self {
+        let len = tree_len(depth) as usize;
+        let vec = vec![fill; len];
         Self { vec }
-    }
-
-    #[inline]
-    fn get_byte(&self, cursor: Cursor<D>) -> u8 {
-        self.vec[cursor.idx as usize]
-    }
-
-    #[inline]
-    fn byte_mut(&mut self, cursor: Cursor<D>) -> &mut u8 {
-        &mut self.vec[cursor.idx as usize]
-    }
-
-    #[inline]
-    fn get(&self, cursor: Cursor<D>, oct: u32) -> bool {
-        (self.get_byte(cursor) >> oct) & 1 != 0
-    }
-
-    #[inline]
-    fn set(&mut self, cursor: Cursor<D>, value: bool, oct: u32) {
-        if value {
-            self.vec[cursor.idx as usize] |= 1 << oct;
-        } else {
-            self.vec[cursor.idx as usize] &= !(1 << oct);
-        }
-    }
-
-    #[inline]
-    fn scan_away(&self, mut cursor: Cursor<D>, pos: UVec3) -> Cursor<D> {
-        while cursor.is_in_bounds() {
-            if !self.get(cursor, cursor.octant(pos)) {
-                return cursor;
-            }
-
-            cursor = cursor.away(pos);
-        }
-        Cursor::root()
     }
 }
 
-#[derive(Clone, Debug)]
-struct ThisHasChildren<const D: u32> {
-    vec: Vec<u8>,
+impl Index<Cursor> for CompleteByteTree {
+    type Output = u8;
+
+    fn index(&self, cursor: Cursor) -> &Self::Output {
+        &self.vec[cursor.index as usize]
+    }
 }
 
-impl<const D: u32> ThisHasChildren<D> {
-    #[inline]
-    fn new() -> Self {
-        let len = tree_len_no_leaves(D);
-        let len_no_root = len - 1;
-        debug_assert_eq!(len_no_root % 8, 0);
-        let byte_len = (len_no_root / 8) as usize;
-        let vec = vec![0; byte_len];
-        Self { vec }
-    }
-
-    fn get(&self, cursor: Cursor<D>) -> bool {
-        debug_assert!(!cursor.is_root());
-        let idx = cursor.idx - 1;
-        let byte_idx = idx / 8;
-        let bit_idx = idx % 8;
-        let byte = self.vec[byte_idx as usize];
-        (byte >> bit_idx) & 1 != 0
-    }
-
-    fn set(&mut self, cursor: Cursor<D>, value: bool) {
-        debug_assert!(!cursor.is_root());
-        let idx = cursor.idx - 1;
-        let byte_idx = idx / 8;
-        let bit_idx = idx % 8;
-        let byte = &mut self.vec[byte_idx as usize];
-        if value {
-            *byte |= 1 << bit_idx;
-        } else {
-            *byte &= !(1 << bit_idx);
-        }
-    }
-
-    fn scan_towards_from_root(&self, pos: UVec3) -> Cursor<D> {
-        let mut cursor = Cursor::root();
-        cursor.toward(pos);
-        while cursor.level > 1 {
-            if !self.get(cursor) {
-                return cursor;
-            }
-            cursor = cursor.toward(pos);
-        }
-        cursor
+impl IndexMut<Cursor> for CompleteByteTree {
+    fn index_mut(&mut self, cursor: Cursor) -> &mut Self::Output {
+        &mut self.vec[cursor.index as usize]
     }
 }
 
@@ -168,62 +114,84 @@ struct Key {
 }
 
 impl Key {
-    fn new(pos: UVec3, level: u32) -> Self {
-        let level = level as u8;
+    fn new(pos: UVec3, level: u8) -> Self {
         let pos = (pos >> level).as_u8vec3();
         Self { level, pos }
-    }
-
-    fn with_oct(mut self, oct: u32) -> Self {
-        self.pos &= !1;
-        self.pos.x |= (oct & 1) as u8;
-        self.pos.y |= ((oct >> 1) & 1) as u8;
-        self.pos.z |= ((oct >> 2) & 1) as u8;
-        self
     }
 }
 
 #[derive(Clone, Debug)]
-struct OctreeInner<T, const D: u32> {
+struct OctreeInner<T> {
     values: HashMap<Key, T>,
-    this_has_children: ThisHasChildren<D>,
-    children_inherit_this: ChildrenInheritThis<D>,
+    have_children: CompleteByteTree,
+    inherit: CompleteByteTree,
 }
 
-impl<T, const D: u32> OctreeInner<T, D> {
-    #[inline]
-    fn new() -> Self {
+impl<T> OctreeInner<T> {
+    fn new(depth: u8) -> Self {
         Self {
             values: HashMap::new(),
-            this_has_children: ThisHasChildren::new(),
-            children_inherit_this: ChildrenInheritThis::new(),
+            have_children: CompleteByteTree::new(h_depth(depth), 0x00),
+            inherit: CompleteByteTree::new(i_depth(depth), 0xFF),
         }
     }
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct Octree<T: Copy + PartialEq, const D: u32 = 5> {
+pub struct Octree<T, const D: u8 = 5> {
     root: T,
-    inner: Option<OctreeInner<T, D>>,
+    inner: Option<OctreeInner<T>>,
 }
 
-impl<T: Copy + PartialEq, const D: u32> Octree<T, D> {
-    pub fn new(root: T) -> Self {
+impl<T, const D: u8> Octree<T, D>
+where
+    T: Clone + PartialEq,
+{
+    pub const fn new(root: T) -> Self {
+        assert!(D > 0);
+        assert!(D <= 8);
         Self { root, inner: None }
     }
 
-    pub fn get(&self, pos: UVec3) -> T {
-        let Some(inner) = &self.inner else {
-            return self.root;
+    const fn root() -> Cursor {
+        Cursor::root(D)
+    }
+
+    const fn h_root() -> Cursor {
+        Cursor::root(h_depth(D))
+    }
+
+    const fn i_root() -> Cursor {
+        Cursor::root(i_depth(D))
+    }
+
+    pub fn get(&self, pos: UVec3) -> &T {
+        let Some(octree) = &self.inner else {
+            return &self.root;
         };
 
-        let cursor = inner.this_has_children.scan_towards_from_root(pos);
-        let inheritee = inner.children_inherit_this.scan_away(cursor, pos);
+        let cursor = Self::root();
+        let h_cursor = Self::h_root();
+        let i_cursor = Self::i_root();
+        loop {
+            cursor.descend_with(pos);
+            let i_oct = octant(pos, cursor.level - 1);
+            if get_child(&octree.have_children[i_cursor], i_oct) {
+
+            }
+
+            h_cursor.descended_with(pos);
+            i_cursor.descended_with(pos);
+
+        }
+        let h_cursor = ChildrenHaveChildren::root(D)
+        let cursor = octree.have_children.scan_towards_from_root(pos);
+        let inheritee = octree.inherit.scan_away(cursor, pos);
 
         if inheritee.is_root() {
             self.root
         } else {
-            *inner.values.get(&inheritee.key(pos)).unwrap()
+            *octree.values.get(&inheritee.key(pos)).unwrap()
         }
 
         // PSEUDO CODE
@@ -249,9 +217,9 @@ impl<T: Copy + PartialEq, const D: u32> Octree<T, D> {
             }
         };
 
-        let cursor = inner.this_has_children.scan_towards_from_root(pos);
+        let cursor = inner.have_children.scan_towards_from_root(pos);
         let c_oct = cursor.octant(pos);
-        let inheritee = inner.children_inherit_this.scan_away(cursor, pos);
+        let inheritee = inner.inherit.scan_away(cursor, pos);
 
         let old_value = if inheritee.is_root() {
             self.root
@@ -264,7 +232,7 @@ impl<T: Copy + PartialEq, const D: u32> Octree<T, D> {
 
         if cursor.level == 0 {
             let parent = cursor.away(pos);
-            let parent_byte = inner.children_inherit_this.get_byte(parent);
+            let parent_byte = inner.inherit.get_byte(parent);
 
             {
                 let mut ancestor = parent;
@@ -281,7 +249,7 @@ impl<T: Copy + PartialEq, const D: u32> Octree<T, D> {
                     cursor = ancestor;
                     ancestor = cursor.away(pos);
                     oct = cursor.octant(pos);
-                    ancestor_byte = inner.children_inherit_this.get_byte(ancestor);
+                    ancestor_byte = inner.inherit.get_byte(ancestor);
 
                     // reevaluate children
                     for oct in 0..8 {
@@ -291,7 +259,7 @@ impl<T: Copy + PartialEq, const D: u32> Octree<T, D> {
                         let other_value = *inner.values.get(&key).unwrap();
                         if value == other_value {
                             inner.values.remove(&key);
-                            inner.children_inherit_this.set(cursor, true, oct);
+                            inner.inherit.set(cursor, true, oct);
                         }
                     }
                 }
@@ -308,12 +276,12 @@ impl<T: Copy + PartialEq, const D: u32> Octree<T, D> {
 
             let doesnt_inherit = (parent_byte >> c_oct) & 1 == 0;
             if doesnt_inherit {
-                let parent_inheritee = inner.children_inherit_this.scan_away(parent, pos);
+                let parent_inheritee = inner.inherit.scan_away(parent, pos);
                 let parent_value = *inner.values.get(&parent_inheritee.key(pos)).unwrap();
                 if parent_value == value {
                     inner.values.remove(&cursor.key(pos)).unwrap();
 
-                    *inner.children_inherit_this.byte_mut(parent) |= 1 << c_oct;
+                    *inner.inherit.byte_mut(parent) |= 1 << c_oct;
 
                     let mut ancestor = parent;
                     let mut anc_byte = parent_byte;
@@ -326,7 +294,7 @@ impl<T: Copy + PartialEq, const D: u32> Octree<T, D> {
                         let mut any_have = false;
                         for oct in 0..8 {
                             let anc_child = ancestor.next(oct);
-                            any_have |= inner.this_has_children.get(anc_child);
+                            any_have |= inner.have_children.get(anc_child);
                         }
                         if any_have {
                             break;
@@ -336,30 +304,30 @@ impl<T: Copy + PartialEq, const D: u32> Octree<T, D> {
                             self.inner = None;
                             return;
                         } else {
-                            inner.this_has_children.set(ancestor, false);
+                            inner.have_children.set(ancestor, false);
                         }
 
                         ancestor = ancestor.away(pos);
-                        anc_byte = inner.children_inherit_this.get_byte(ancestor);
+                        anc_byte = inner.inherit.get_byte(ancestor);
                     }
 
                     return;
                 }
             }
 
-            inner.children_inherit_this.set(parent, false, c_oct);
+            inner.inherit.set(parent, false, c_oct);
             inner.values.insert(cursor.key(pos), value);
         } else {
             let mut last = cursor;
             let mut drill = cursor;
             while drill.level != 0 {
-                inner.this_has_children.set(drill, true);
+                inner.have_children.set(drill, true);
                 last = drill;
                 drill = drill.toward(pos);
             }
             inner.values.insert(cursor.key(pos), value);
             let oct = drill.octant(pos);
-            inner.children_inherit_this.set(last, false, oct)
+            inner.inherit.set(last, false, oct)
         }
 
         // FIRST if we don't have any inner AND the value is the same as the root, do nothing
@@ -449,7 +417,8 @@ impl<T: Copy + PartialEq, const D: u32> Octree<T, D> {
 ///
 /// Equal to \sum_{d=0}^{D} 8^{d} = \frac{8^{D+1}-1}{7}
 #[inline]
-const fn tree_len(depth: u32) -> u32 {
+const fn tree_len(depth: u8) -> u32 {
+    let depth = depth as u32;
     (8u32.pow(depth + 1) - 1) / 7
 }
 
@@ -466,8 +435,38 @@ const fn subtree_len(depth: u32) -> u32 {
 }
 
 #[inline]
-fn octant(mut pos: UVec3, level: u32) -> u32 {
+fn octant(mut pos: UVec3, level: u8) -> u32 {
     pos >>= level;
     pos &= 1;
     pos.x | pos.y << 1 | pos.z << 2
+}
+
+#[inline]
+fn with_octant(pos: UVec3, level: u32, octant: u32) -> UVec3 {
+    let x = octant & 1;
+    let y = (octant >> 1) & 1;
+    let z = (octant >> 2) & 1;
+    let set = UVec3::new(x, y, z) << level;
+    let clear = UVec3::ONE << level;
+    (pos & !clear) | set
+}
+
+fn get_child(byte: &u8, oct: u32) -> bool {
+    (*byte >> oct) & 1 != 0
+}
+
+fn set_child(byte: &mut u8, oct: u32, value: bool) {
+    if value {
+        *byte |= 1 << oct;
+    } else {
+        *byte &= !(1 << oct);
+    }
+}
+
+const fn h_depth(depth: u8) -> u8 {
+    depth - 1
+}
+
+const fn i_depth(depth: u8) -> u8 {
+    depth - 2
 }
