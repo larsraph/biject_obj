@@ -108,8 +108,8 @@ impl<T> OctreeInner<T> {
     fn new(depth: u32) -> Self {
         Self {
             values: HashMap::new(),
-            children_have_children: CompleteByteOctree::new(depth - 1, 0x00),
-            children_inherit_this: CompleteByteOctree::new(depth - 2, 0xFF),
+            children_have_children: CompleteByteOctree::new(depth - 2, 0x00),
+            children_inherit_this: CompleteByteOctree::new(depth - 1, 0xFF),
         }
     }
 }
@@ -133,14 +133,14 @@ where
     }
 
     const fn h_root() -> Cursor {
-        Cursor::root(D - 1)
-    }
-
-    const fn i_root() -> Cursor {
         Cursor::root(D - 2)
     }
 
-    pub fn _get(&self, pos: UVec3) -> &T {
+    const fn i_root() -> Cursor {
+        Cursor::root(D - 1)
+    }
+
+    pub fn get(&self, pos: UVec3) -> &T {
         let Some(OctreeInner {
             values,
             children_have_children: have,
@@ -362,18 +362,20 @@ where
                 values.insert(Key::new(pos, level), value);
             }
         } else {
+            let mut h_cursor2 = h_cursor;
             let mut i_cursor2 = i_cursor;
             let mut level2 = level;
             let mut octant2 = octant;
 
             while level2 != 0 {
-                have.set_child(i_cursor2, octant2, true);
+                have.set_child(h_cursor2, octant2, true);
 
+                h_cursor2.descend(octant2);
                 i_cursor2.descend(octant2);
                 level2 -= 1;
                 octant2 = get_octant(pos, level2);
             }
-            values.insert(Key::new(pos, level), value);
+            values.insert(Key::new(pos, level2), value);
             inherit.set_child(i_cursor2, octant2, false);
         }
 
@@ -482,5 +484,112 @@ const fn set_child(byte: &mut u8, octant: u32, value: bool) {
         *byte |= 1 << octant;
     } else {
         *byte &= !(1 << octant);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tree_len_matches_geometric_sum() {
+        let mut expected = 0;
+        let mut nodes_at_level = 1;
+
+        for depth in 0..=8 {
+            expected += nodes_at_level;
+            assert_eq!(tree_len(depth), expected);
+            nodes_at_level *= 8;
+        }
+    }
+
+    #[test]
+    fn cursor_descend_and_ascend_are_inverses() {
+        for depth in 1..=8 {
+            let root = Cursor::root(depth);
+
+            for octant in 0..8 {
+                let mut cursor = root;
+                cursor.descend(octant);
+                assert_eq!(cursor.tree_len, tree_len(depth - 1));
+                assert_eq!(cursor.index, 1 + octant * tree_len(depth - 1));
+                cursor.ascend(octant);
+                assert_eq!(cursor, root);
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_indexes_all_nodes_once() {
+        fn visit(cursor: Cursor, depth: u32, indexes: &mut Vec<u32>) {
+            indexes.push(cursor.index);
+            if depth == 0 {
+                return;
+            }
+
+            for octant in 0..8 {
+                visit(cursor.descended(octant), depth - 1, indexes);
+            }
+        }
+
+        for depth in 0..=5 {
+            let mut indexes = Vec::new();
+            visit(Cursor::root(depth), depth, &mut indexes);
+            indexes.sort_unstable();
+            assert_eq!(indexes, (0..tree_len(depth)).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn complete_byte_octree_indexes_are_independent() {
+        let mut tree = CompleteByteOctree::new(2, 0);
+        let root = Cursor::root(2);
+
+        tree.set_child(root, 3, true);
+        tree.set_child(root, 5, true);
+
+        assert!(tree.get_child(root, 3));
+        assert!(tree.get_child(root, 5));
+        assert!(!tree.get_child(root, 0));
+        assert!(!tree.get_child(root, 4));
+    }
+
+    #[test]
+    fn octree_get_returns_root_and_set_values() {
+        let mut tree = Octree::<u8, 3>::new(0);
+        let first = UVec3::new(0, 0, 0);
+        let second = UVec3::new(7, 3, 5);
+
+        assert_eq!(*tree.get(first), 0);
+        assert_eq!(*tree.get(second), 0);
+
+        tree.set(first, 1);
+        tree.set(second, 2);
+
+        assert_eq!(*tree.get(first), 1);
+        assert_eq!(*tree.get(second), 2);
+    }
+
+    #[test]
+    fn octree_preserves_values_for_all_octants() {
+        let mut tree = Octree::<u8, 3>::new(0);
+
+        for octant in 0..8 {
+            let pos = UVec3::new(
+                (octant & 1) * 4,
+                ((octant >> 1) & 1) * 4,
+                ((octant >> 2) & 1) * 4,
+            );
+            tree.set(pos, octant as u8 + 1);
+        }
+
+        for octant in 0..8 {
+            let pos = UVec3::new(
+                (octant & 1) * 4,
+                ((octant >> 1) & 1) * 4,
+                ((octant >> 2) & 1) * 4,
+            );
+            assert_eq!(*tree.get(pos), octant as u8 + 1);
+        }
     }
 }
