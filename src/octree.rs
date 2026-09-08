@@ -180,9 +180,8 @@ where
     T: Clone + PartialEq,
 {
     pub const fn new(root: T) -> Self {
-        // OctreeInner panics for D < 2.
-        // Technically D should be able to equal 0 and 1 but I'm too lazy to handle it.
-        assert!(D > 1);
+        // The metadata trees require at least one level below their roots.
+        assert!(D >= 3);
         assert!(D <= 8);
         Self { root, inner: None }
     }
@@ -862,5 +861,20 @@ mod tests {
         tree.set(pos, 0);
         tree.set(pos, 0);
         assert_eq!(*tree.get(pos), 0);
+    }
+
+    #[test]
+    fn octree_promotes_through_explicit_parent_without_losing_siblings() {
+        let mut tree = Octree::<u8, 3>::new(0);
+        let target = UVec3::new(0, 0, 0);
+        let sibling = UVec3::new(0, 0, 1);
+
+        tree.set(target, 1);
+        tree.set(sibling, 2);
+        tree.set(target, 2);
+
+        assert_eq!(*tree.get(target), 2);
+        assert_eq!(*tree.get(sibling), 2);
+        assert_eq!(*tree.get(UVec3::new(0, 1, 0)), 0);
     }
 }
