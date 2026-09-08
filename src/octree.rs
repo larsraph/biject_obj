@@ -360,9 +360,60 @@ where
                 // woops need to include the backpass merging here as well.
                 if once {
                     // Insert the value at the highest level possible such that all values
-                    // iterated in the loop above inherit this.
-                    inherit.set_child(p_inherit, n_level, false);
-                    values.insert(n_level.key(), value);
+                    // iterated in the loop above inherit this. But first we much check
+                    // if the highest level can inherit its parent instead of inserting.
+
+                    let base_n_level = n_level;
+                    let base_p_inherit = p_inherit;
+                    let base_p_have = p_have;
+
+                    // for now this is copy-pasta but we should dedupe this code.
+                    let parent_value = if base_n_level.level == D - 1 {
+                        &self.root
+                    } else {
+                        let mut n_level = base_n_level.ascended();
+                        let mut p_inherit = base_p_inherit.ascended(&n_level);
+                        Self::scan_inheritance(
+                            &mut p_inherit,
+                            &mut n_level,
+                            inherit,
+                            values,
+                            &self.root,
+                        )
+                    };
+
+                    if *parent_value == value {
+                        values.remove(&base_n_level.key()).unwrap();
+                        inherit.set_child(base_p_inherit, base_n_level, true);
+
+                        let mut p_inherit = base_p_inherit;
+                        let mut p_have = base_p_have;
+                        let mut n_level = base_n_level;
+
+                        // try to merge uniform regions
+                        loop {
+                            // we know we're not at l0 so we know we're not OB in have
+                            let siblings_leafs = have[p_have] == 0x00;
+                            let siblings_inherit = inherit[p_inherit] == 0xFF;
+                            if !(siblings_leafs && siblings_inherit) {
+                                break;
+                            }
+
+                            if n_level.level == D - 1 {
+                                self.inner = None;
+                                return;
+                            }
+
+                            n_level.ascend();
+                            p_inherit.ascend(&n_level);
+                            p_have.ascend(&n_level);
+
+                            have.set_child(p_have, n_level, false);
+                        }
+                    } else {
+                        inherit.set_child(p_inherit, n_level, false);
+                        values.insert(n_level.key(), value);
+                    }
                     return;
                 }
             }
