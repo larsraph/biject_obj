@@ -336,8 +336,11 @@ where
                         }
                     }
 
-                    if n_level.level == D {
+                    if n_level.level == D - 1 {
                         self.root = value;
+                        if inherit[p_inherit] == 0xFF && have[p_have] == 0x00 {
+                            self.inner = None;
+                        }
                         return;
                     }
 
@@ -752,5 +755,61 @@ mod tests {
         assert_eq!(*tree.get(b), 0);
         assert_eq!(*tree.get(c), 1);
         assert_eq!(*tree.get(d), 3);
+    }
+
+    #[test]
+    fn octree_reads_value_promoted_to_root_child() {
+        let mut tree = Octree::<u8, 3>::new(0);
+
+        for z in 0..2 {
+            for y in 0..2 {
+                for x in 0..2 {
+                    tree.set(UVec3::new(x, y, z), 7);
+                }
+            }
+        }
+
+        assert_eq!(*tree.get(UVec3::new(0, 0, 0)), 7);
+        assert_eq!(*tree.get(UVec3::new(1, 1, 1)), 7);
+        assert_eq!(*tree.get(UVec3::new(2, 0, 0)), 0);
+    }
+
+    #[test]
+    fn octree_collapses_to_root_after_restoring_every_cell() {
+        let mut tree = Octree::<u8, 3>::new(0);
+
+        for z in 0..4 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    tree.set(UVec3::new(x, y, z), 5);
+                }
+            }
+        }
+
+        for z in 0..4 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    tree.set(UVec3::new(x, y, z), 0);
+                }
+            }
+        }
+
+        assert!(tree.inner.is_none());
+        assert_eq!(*tree.get(UVec3::new(3, 3, 3)), 0);
+    }
+
+    #[test]
+    fn octree_repeated_same_value_writes_are_idempotent() {
+        let mut tree = Octree::<u8, 3>::new(0);
+        let pos = UVec3::new(3, 5, 6);
+
+        for _ in 0..8 {
+            tree.set(pos, 9);
+            assert_eq!(*tree.get(pos), 9);
+        }
+
+        tree.set(pos, 0);
+        tree.set(pos, 0);
+        assert_eq!(*tree.get(pos), 0);
     }
 }
