@@ -224,10 +224,15 @@ where
         root: &'a T,
     ) -> &'a T {
         let mut value = root;
-        // stop before the root (level = D) since the root cannot inherit
-        while n_level.level != D - 1 {
+        // Check through the first level below the root; the root itself has no
+        // inheritance metadata.
+        loop {
             if !inherit.get_child(*p_inherit, *n_level) {
                 value = values.get(&n_level.key()).unwrap();
+                break;
+            }
+
+            if n_level.level == D - 1 {
                 break;
             }
 
@@ -331,7 +336,7 @@ where
                         }
                     }
 
-                    let unify = false;
+                    let unify = inherit[p_inherit] == 0xFF && have[p_have] == 0x00;
 
                     if n_level.level == D {
                         self.root = value;
