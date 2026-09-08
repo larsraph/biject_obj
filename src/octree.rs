@@ -177,7 +177,7 @@ pub struct Octree<T, const D: u32 = 5> {
 
 impl<T, const D: u32> Octree<T, D>
 where
-    T: Clone + PartialEq,
+    T: PartialEq,
 {
     pub const fn new(root: T) -> Self {
         // The metadata trees require at least one level below their roots.
