@@ -336,12 +336,12 @@ where
                         }
                     }
 
-                    let unify = inherit[p_inherit] == 0xFF && have[p_have] == 0x00;
-
                     if n_level.level == D {
                         self.root = value;
                         return;
                     }
+
+                    let unify = inherit[p_inherit] == 0xFF && have[p_have] == 0x00;
 
                     n_level.ascend();
                     p_inherit.ascend(&n_level);
