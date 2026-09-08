@@ -305,6 +305,7 @@ where
             // sole inheritor (change inherited value)
             {
                 let mut p_inherit = base_p_inherit;
+                let mut p_have = base_p_have;
                 let mut n_level = base_n_level;
 
                 let mut once = false;
@@ -324,9 +325,13 @@ where
                         let other_value = values.get(&key).unwrap();
                         if *other_value == value {
                             values.remove(&key);
-                            inherit.set_child(p_inherit, n_level, true);
+                            let mut sibling = n_level;
+                            sibling.octant = octant;
+                            inherit.set_child(p_inherit, sibling, true);
                         }
                     }
+
+                    let unify = false;
 
                     if n_level.level == D {
                         self.root = value;
@@ -335,6 +340,11 @@ where
 
                     n_level.ascend();
                     p_inherit.ascend(&n_level);
+                    p_have.ascend(&n_level);
+
+                    if unify {
+                        have.set_child(p_have, n_level, false);
+                    }
 
                     once = true;
                 }
