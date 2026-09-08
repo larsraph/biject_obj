@@ -543,6 +543,7 @@ const fn set_child(byte: &mut u8, octant: u32, value: bool) {
     }
 }
 
+/// unreviewed AI tests.
 #[cfg(test)]
 mod tests {
     use super::*;
