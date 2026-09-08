@@ -146,7 +146,8 @@ impl Key {
         let x = octant & 1;
         let y = (octant >> 1) & 1;
         let z = (octant >> 2) & 1;
-        self.pos += UVec3::new(x, y, z).as_u8vec3();
+        self.pos &= !1;
+        self.pos |= UVec3::new(x, y, z).as_u8vec3();
         self
     }
 }
@@ -338,9 +339,11 @@ where
                     once = true;
                 }
 
+                // woops need to include the backpass merging here as well.
                 if once {
                     // Insert the value at the highest level possible such that all values
                     // iterated in the loop above inherit this.
+                    inherit.set_child(p_inherit, n_level, false);
                     values.insert(n_level.key(), value);
                     return;
                 }
@@ -661,7 +664,7 @@ mod tests {
 
         for value in &mut expected {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            *value = (state % 11) as u8;
+            *value = (state % 11) as u8 + 1;
         }
 
         for (index, &value) in expected.iter().enumerate() {
@@ -671,6 +674,19 @@ mod tests {
                 (index / 16) as u32,
             );
             tree.set(pos, value);
+
+            for (check_index, &expected_value) in expected.iter().enumerate().take(index + 1) {
+                let check_pos = UVec3::new(
+                    (check_index % 4) as u32,
+                    ((check_index / 4) % 4) as u32,
+                    (check_index / 16) as u32,
+                );
+                assert_eq!(
+                    *tree.get(check_pos),
+                    expected_value,
+                    "first mismatch after setting index {index}, checking {check_index} at {check_pos:?}"
+                );
+            }
         }
 
         let mut round_trip = [0u8; 64];
