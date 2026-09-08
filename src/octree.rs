@@ -5,37 +5,89 @@ use bevy::{
     platform::collections::HashMap,
 };
 
+/// Tracks the `level` we're on and the `octant` of `pos` in the level.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct LevelCursor<'a> {
+    level: u32,
+    pos: &'a UVec3,
+    octant: u32,
+}
+
+impl<'a> LevelCursor<'a> {
+    const fn root(depth: u32, pos: &'a UVec3) -> Self {
+        LevelCursor {
+            // The octant of `pos` in the root level is always 0.
+            octant: 0,
+            level: depth,
+            pos,
+        }
+    }
+
+    fn key(&self) -> Key {
+        Key::new(*self.pos, self.level)
+    }
+
+    #[track_caller]
+    fn descend(&mut self) {
+        self.level -= 1;
+        self.octant = get_octant(*self.pos, self.level);
+    }
+
+    #[track_caller]
+    fn descended(mut self) -> Self {
+        self.descend();
+        self
+    }
+
+    #[track_caller]
+    fn ascend(&mut self) {
+        self.level += 1;
+        self.octant = get_octant(*self.pos, self.level);
+    }
+
+    #[track_caller]
+    fn ascended(mut self) -> Self {
+        self.ascend();
+        self
+    }
+}
+
+/// Tracks the `index` and `tree_len` of the level we're on.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct Cursor {
+struct TreeCursor {
     index: u32,
     tree_len: u32,
 }
 
-impl Cursor {
+impl TreeCursor {
     const fn root(depth: u32) -> Self {
-        Cursor {
+        TreeCursor {
             index: 0,
             tree_len: tree_len(depth),
         }
     }
 
-    const fn descend(&mut self, octant: u32) {
+    #[track_caller]
+    fn descend(&mut self, child: &LevelCursor) {
         self.tree_len = (self.tree_len - 1) / 8;
-        self.index += 1 + octant * self.tree_len;
+        self.index += 1 + child.octant * self.tree_len;
     }
 
-    const fn ascend(&mut self, octant: u32) {
-        self.index -= 1 + octant * self.tree_len;
-        self.tree_len = (self.tree_len * 8) + 1;
-    }
-
-    const fn ascended(mut self, octant: u32) -> Self {
-        self.ascend(octant);
+    #[track_caller]
+    fn descended(mut self, child: &LevelCursor) -> Self {
+        self.descend(child);
         self
     }
 
-    const fn descended(mut self, octant: u32) -> Self {
-        self.descend(octant);
+    #[track_caller]
+    fn ascend(&mut self, this: &LevelCursor) {
+        self.index -= 1 + this.octant * self.tree_len;
+        self.tree_len = self.tree_len * 8 + 1;
+    }
+
+    #[track_caller]
+    fn ascended(mut self, this: &LevelCursor) -> Self {
+        self.ascend(this);
         self
     }
 }
@@ -52,25 +104,27 @@ impl CompleteByteOctree {
         Self { vec }
     }
 
-    fn get_child(&self, cursor: Cursor, octant: u32) -> bool {
-        get_child(&self[cursor], octant)
+    #[track_caller]
+    fn get_child(&self, cursor: TreeCursor, child: LevelCursor) -> bool {
+        get_child(&self[cursor], child.octant)
     }
 
-    fn set_child(&mut self, cursor: Cursor, octant: u32, value: bool) {
-        set_child(&mut self[cursor], octant, value);
+    #[track_caller]
+    fn set_child(&mut self, cursor: TreeCursor, child: LevelCursor, value: bool) {
+        set_child(&mut self[cursor], child.octant, value);
     }
 }
 
-impl Index<Cursor> for CompleteByteOctree {
+impl Index<TreeCursor> for CompleteByteOctree {
     type Output = u8;
 
-    fn index(&self, cursor: Cursor) -> &Self::Output {
+    fn index(&self, cursor: TreeCursor) -> &Self::Output {
         &self.vec[cursor.index as usize]
     }
 }
 
-impl IndexMut<Cursor> for CompleteByteOctree {
-    fn index_mut(&mut self, cursor: Cursor) -> &mut Self::Output {
+impl IndexMut<TreeCursor> for CompleteByteOctree {
+    fn index_mut(&mut self, cursor: TreeCursor) -> &mut Self::Output {
         &mut self.vec[cursor.index as usize]
     }
 }
@@ -132,12 +186,54 @@ where
         Self { root, inner: None }
     }
 
-    const fn h_root() -> Cursor {
-        Cursor::root(D - 2)
+    const fn have_root() -> TreeCursor {
+        TreeCursor::root(D - 2)
     }
 
-    const fn i_root() -> Cursor {
-        Cursor::root(D - 1)
+    const fn inherit_root() -> TreeCursor {
+        TreeCursor::root(D - 1)
+    }
+
+    const fn level_root(pos: &UVec3) -> LevelCursor {
+        LevelCursor::root(D, pos)
+    }
+
+    fn scan_have(
+        p_have: &mut TreeCursor,
+        p_inherit: &mut TreeCursor,
+        n_level: &mut LevelCursor,
+        have: &CompleteByteOctree,
+    ) {
+        while n_level.level != 0 {
+            if !have.get_child(*p_have, *n_level) {
+                break;
+            }
+
+            p_have.descend(&n_level);
+            p_inherit.descend(&n_level);
+            n_level.descend();
+        }
+    }
+
+    fn scan_inheritance<'a>(
+        p_inherit: &mut TreeCursor,
+        n_level: &mut LevelCursor,
+        inherit: &CompleteByteOctree,
+        values: &'a HashMap<Key, T>,
+        root: &'a T,
+    ) -> &'a T {
+        let mut value = root;
+        // stop before the root (level = D) since the root cannot inherit
+        while n_level.level != D - 1 {
+            if !inherit.get_child(*p_inherit, *n_level) {
+                value = values.get(&n_level.key()).unwrap();
+                break;
+            }
+
+            n_level.ascend();
+            p_inherit.ascend(&n_level);
+        }
+        value
     }
 
     pub fn get(&self, pos: UVec3) -> &T {
@@ -150,33 +246,12 @@ where
             return &self.root;
         };
 
-        let mut h_cursor = Self::h_root();
-        let mut i_cursor = Self::i_root();
+        let mut p_have = Self::have_root();
+        let mut p_inherit = Self::inherit_root();
+        let mut n_level = Self::level_root(&pos).descended();
 
-        let mut level = D - 1;
-        let mut octant = get_octant(pos, level);
-
-        while level != 0 {
-            if !have.get_child(h_cursor, octant) {
-                break;
-            }
-
-            h_cursor.descend(octant);
-            i_cursor.descend(octant);
-            level -= 1;
-            octant = get_octant(pos, level);
-        }
-
-        while level != D {
-            if !inherit.get_child(i_cursor, octant) {
-                return values.get(&Key::new(pos, level)).unwrap();
-            }
-
-            i_cursor.ascend(octant);
-            level += 1;
-            octant = get_octant(pos, level);
-        }
-        &self.root
+        Self::scan_have(&mut p_have, &mut p_inherit, &mut n_level, have);
+        Self::scan_inheritance(&mut p_inherit, &mut n_level, inherit, values, &self.root)
 
         // PSEUDO CODE
         //
@@ -198,185 +273,148 @@ where
         } = match &mut self.inner {
             Some(inner) => inner,
             None => {
-                if value == self.root {
+                if self.root == value {
                     return;
                 }
                 self.inner.insert(OctreeInner::new(D))
             }
         };
 
-        // Keep in mind these cursors always point to the parent of the node in question.
-        let mut h_cursor = Self::h_root();
-        let mut i_cursor = Self::i_root();
+        let base_p_have;
+        let base_p_inherit;
+        let base_n_level;
+        {
+            let mut p_have = Self::have_root();
+            let mut p_inherit = Self::inherit_root();
+            let mut n_level = Self::level_root(&pos).descended();
+            Self::scan_have(&mut p_have, &mut p_inherit, &mut n_level, have);
 
-        let mut level = D - 1;
-        let mut octant = get_octant(pos, level);
+            base_p_have = p_have;
+            base_p_inherit = p_inherit;
+            base_n_level = n_level;
 
-        while level != 0 {
-            if !have.get_child(h_cursor, octant) {
-                break;
-            }
-
-            h_cursor.descend(octant);
-            i_cursor.descend(octant);
-            level -= 1;
-            octant = get_octant(pos, level);
-        }
-        let h_cursor = h_cursor;
-        let i_cursor = i_cursor;
-        let octant = octant;
-        let level = level;
-
-        let mut i_cursor2 = i_cursor;
-        let mut octant2 = octant;
-        let mut level2 = level;
-        let i_byte = inherit[i_cursor];
-
-        let mut old_value = &self.root;
-        if !get_child(&i_byte, octant2) {
-            i_cursor2.ascend(octant2);
-            level2 += 1;
-            octant2 = get_octant(pos, level2);
-
-            while level2 != D {
-                if !inherit.get_child(i_cursor2, octant2) {
-                    old_value = values.get(&Key::new(pos, level2)).unwrap();
-                    break;
-                }
-
-                i_cursor2.ascend(octant2);
-                level2 += 1;
-                octant2 = get_octant(pos, level2);
+            let old_value =
+                Self::scan_inheritance(&mut p_inherit, &mut n_level, inherit, values, &self.root);
+            if *old_value == value {
+                return;
             }
         }
-        if *old_value == value {
-            return;
-        }
 
-        if level == 0 {
+        if base_n_level.level == 0 {
+            // sole inheritor (change inherited value)
             {
-                let mut i_cursor2 = i_cursor;
-                let mut octant2 = octant;
-                let mut level2 = level;
-                let mut i_byte2 = i_byte;
+                let mut p_inherit = base_p_inherit;
+                let mut n_level = base_n_level;
 
                 let mut once = false;
 
                 loop {
-                    if i_byte2 != 1 << octant2 {
+                    let sole_inheritor = inherit[p_inherit] == 1 << n_level.octant;
+                    if !sole_inheritor {
                         break;
                     }
 
                     for octant in 0..8 {
-                        if octant == octant2 {
+                        if octant == n_level.octant {
                             continue;
                         }
 
-                        let key = Key::new(pos, level2).with_octant(octant);
-
+                        let key = n_level.key().with_octant(octant);
                         let other_value = values.get(&key).unwrap();
                         if *other_value == value {
                             values.remove(&key);
-                            inherit.set_child(i_cursor2, octant, true);
+                            inherit.set_child(p_inherit, n_level, true);
                         }
                     }
 
-                    if level2 == D {
+                    if n_level.level == D {
                         self.root = value;
                         return;
                     }
 
-                    i_cursor2.ascend(octant2);
-                    i_byte2 = inherit[i_cursor2];
-                    level2 += 1;
-                    octant2 = get_octant(pos, level2);
+                    n_level.ascend();
+                    p_inherit.ascend(&n_level);
 
                     once = true;
                 }
 
                 if once {
-                    values.insert(Key::new(pos, level), value);
+                    // Insert the value at the highest level possible such that all values
+                    // iterated in the loop above inherit this.
+                    values.insert(n_level.key(), value);
                     return;
                 }
             }
 
-            if !get_child(&i_byte, octant) {
-                let mut i_cursor2 = i_cursor.ascended(octant);
-                let mut level2 = level + 1;
-                let mut octant2 = get_octant(pos, level2);
+            // not an inheritor (try to inherit)
+            {
+                let inheritor = inherit.get_child(base_p_inherit, base_n_level);
+                if !inheritor {
+                    // check the chain of inheritance of the parent
+                    let parent_value = {
+                        let mut n_level = base_n_level.ascended();
+                        let mut p_inherit = base_p_inherit.ascended(&n_level);
+                        Self::scan_inheritance(
+                            &mut p_inherit,
+                            &mut n_level,
+                            inherit,
+                            values,
+                            &self.root,
+                        )
+                    };
 
-                let mut parent_value = &self.root;
-                while level2 != D {
-                    if !inherit.get_child(i_cursor2, octant2) {
-                        parent_value = values.get(&Key::new(pos, level2)).unwrap();
-                        break;
-                    }
+                    if *parent_value == value {
+                        values.remove(&base_n_level.key()).unwrap();
+                        inherit.set_child(base_p_inherit, base_n_level, true);
 
-                    i_cursor2.ascend(octant2);
-                    level2 += 1;
-                    octant2 = get_octant(pos, level2);
-                }
+                        // l1 has an implicit 0x00 for the have byte indicating that all l0 nodes are leafs
+                        let mut have_val = 0x00;
+                        let mut p_inherit = base_p_inherit;
+                        let mut p_have = base_p_have;
+                        let mut n_level = base_n_level;
 
-                if *parent_value == value {
-                    values.remove(&Key::new(pos, level)).unwrap();
-
-                    let i_byte = &mut inherit[i_cursor];
-                    set_child(i_byte, octant, true);
-
-                    if *i_byte == 0xFF {
-                        let mut h_cursor2 = h_cursor.ascended(octant);
-                        let mut i_cursor2 = i_cursor.ascended(octant);
-                        let mut level2 = level + 1;
-                        let mut octant2 = get_octant(pos, level2);
-
-                        let h_byte2 = &mut have[h_cursor2];
-                        set_child(h_byte2, octant2, false);
-                        let mut h_byte2 = *h_byte2;
-
+                        // try to merge uniform regions
                         loop {
-                            if h_byte2 != 0x00 && inherit[i_cursor2] != 0xFF {
+                            let siblings_leafs = have_val == 0x00;
+                            let siblings_inherit = inherit[p_inherit] == 0xFF;
+                            if !(siblings_leafs && siblings_inherit) {
                                 break;
                             }
 
-                            level2 += 1;
-                            if level2 == D {
+                            if n_level.level == D - 1 {
                                 self.inner = None;
                                 return;
                             }
-                            h_cursor2.ascend(octant2);
-                            i_cursor2.ascend(octant2);
-                            octant2 = get_octant(pos, level2);
 
-                            let byte = &mut have[h_cursor2];
-                            set_child(byte, octant2, false);
-                            h_byte2 = *byte;
+                            n_level.ascend();
+                            p_inherit.ascend(&n_level);
+                            p_have.ascend(&n_level);
+
+                            have.set_child(p_have, n_level, false);
+                            have_val = have[p_have];
                         }
+                        return;
                     }
-
-                    return;
                 } else {
-                    values.insert(Key::new(pos, level), value);
+                    inherit.set_child(base_p_inherit, base_n_level, false);
                 }
-            } else {
-                inherit.set_child(i_cursor, octant, false);
-                values.insert(Key::new(pos, level), value);
+                values.insert(base_n_level.key(), value);
             }
         } else {
-            let mut h_cursor2 = h_cursor;
-            let mut i_cursor2 = i_cursor;
-            let mut level2 = level;
-            let mut octant2 = octant;
+            let mut p_have = base_p_have;
+            let mut p_inherit = base_p_inherit;
+            let mut n_level = base_n_level;
 
-            while level2 != 0 {
-                have.set_child(h_cursor2, octant2, true);
+            while n_level.level != 0 {
+                have.set_child(p_have, n_level, true);
 
-                h_cursor2.descend(octant2);
-                i_cursor2.descend(octant2);
-                level2 -= 1;
-                octant2 = get_octant(pos, level2);
+                p_have.descend(&n_level);
+                p_inherit.descend(&n_level);
+                n_level.descend();
             }
-            values.insert(Key::new(pos, level2), value);
-            inherit.set_child(i_cursor2, octant2, false);
+
+            values.insert(n_level.key(), value);
+            inherit.set_child(p_inherit, n_level, false);
         }
 
         // FIRST if we don't have any inner AND the value is the same as the root, do nothing
@@ -506,14 +544,18 @@ mod tests {
     #[test]
     fn cursor_descend_and_ascend_are_inverses() {
         for depth in 1..=8 {
-            let root = Cursor::root(depth);
+            let root = TreeCursor::root(depth);
+            let pos = UVec3::ZERO;
+            let mut level = LevelCursor::root(depth, &pos);
+            level.descend();
 
             for octant in 0..8 {
+                level.octant = octant;
                 let mut cursor = root;
-                cursor.descend(octant);
+                cursor.descend(&level);
                 assert_eq!(cursor.tree_len, tree_len(depth - 1));
                 assert_eq!(cursor.index, 1 + octant * tree_len(depth - 1));
-                cursor.ascend(octant);
+                cursor.ascend(&level);
                 assert_eq!(cursor, root);
             }
         }
@@ -521,20 +563,26 @@ mod tests {
 
     #[test]
     fn cursor_indexes_all_nodes_once() {
-        fn visit(cursor: Cursor, depth: u32, indexes: &mut Vec<u32>) {
+        fn visit(cursor: TreeCursor, depth: u32, indexes: &mut Vec<u32>) {
             indexes.push(cursor.index);
             if depth == 0 {
                 return;
             }
 
             for octant in 0..8 {
-                visit(cursor.descended(octant), depth - 1, indexes);
+                let pos = UVec3::new(
+                    (octant & 1) << (depth - 1),
+                    ((octant >> 1) & 1) << (depth - 1),
+                    ((octant >> 2) & 1) << (depth - 1),
+                );
+                let child = LevelCursor::root(depth, &pos).descended();
+                visit(cursor.descended(&child), depth - 1, indexes);
             }
         }
 
         for depth in 0..=5 {
             let mut indexes = Vec::new();
-            visit(Cursor::root(depth), depth, &mut indexes);
+            visit(TreeCursor::root(depth), depth, &mut indexes);
             indexes.sort_unstable();
             assert_eq!(indexes, (0..tree_len(depth)).collect::<Vec<_>>());
         }
@@ -543,15 +591,27 @@ mod tests {
     #[test]
     fn complete_byte_octree_indexes_are_independent() {
         let mut tree = CompleteByteOctree::new(2, 0);
-        let root = Cursor::root(2);
+        let root = TreeCursor::root(2);
+        let pos3 = UVec3::new(2, 2, 0);
+        let pos5 = UVec3::new(0, 2, 2);
+        let child3 = LevelCursor::root(2, &pos3).descended();
+        let child5 = LevelCursor::root(2, &pos5).descended();
 
-        tree.set_child(root, 3, true);
-        tree.set_child(root, 5, true);
+        tree.set_child(root, child3, true);
+        tree.set_child(root, child5, true);
 
-        assert!(tree.get_child(root, 3));
-        assert!(tree.get_child(root, 5));
-        assert!(!tree.get_child(root, 0));
-        assert!(!tree.get_child(root, 4));
+        assert!(tree.get_child(root, child3));
+        assert!(tree.get_child(root, child5));
+        assert!(!tree.get_child(root, LevelCursor::root(2, &UVec3::ZERO).descended()));
+        assert!(!tree.get_child(root, LevelCursor::root(2, &UVec3::new(0, 2, 0)).descended()));
+    }
+
+    #[test]
+    fn metadata_trees_have_expected_depths() {
+        let inner = OctreeInner::<u8>::new(3);
+
+        assert_eq!(inner.children_have_children.vec.len(), tree_len(1) as usize);
+        assert_eq!(inner.children_inherit_this.vec.len(), tree_len(2) as usize);
     }
 
     #[test]
@@ -591,5 +651,74 @@ mod tests {
             );
             assert_eq!(*tree.get(pos), octant as u8 + 1);
         }
+    }
+
+    #[test]
+    fn octree_round_trips_deterministic_random_volume() {
+        let mut tree = Octree::<u8, 3>::new(0);
+        let mut expected = [0u8; 64];
+        let mut state = 0x9e37_79b9u32;
+
+        for value in &mut expected {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *value = (state % 11) as u8;
+        }
+
+        for (index, &value) in expected.iter().enumerate() {
+            let pos = UVec3::new(
+                (index % 4) as u32,
+                ((index / 4) % 4) as u32,
+                (index / 16) as u32,
+            );
+            tree.set(pos, value);
+        }
+
+        let mut round_trip = [0u8; 64];
+        for (index, value) in round_trip.iter_mut().enumerate() {
+            let pos = UVec3::new(
+                (index % 4) as u32,
+                ((index / 4) % 4) as u32,
+                (index / 16) as u32,
+            );
+            *value = *tree.get(pos);
+        }
+
+        assert_eq!(round_trip, expected);
+    }
+
+    #[test]
+    fn octree_set_exercises_merge_transitions() {
+        let mut tree = Octree::<u8, 3>::new(0);
+        let a = UVec3::new(0, 0, 0);
+        let b = UVec3::new(0, 0, 1);
+        let c = UVec3::new(0, 1, 0);
+        let d = UVec3::new(0, 1, 1);
+
+        tree.set(a, 1);
+        assert_eq!(*tree.get(a), 1);
+
+        tree.set(b, 2);
+        assert_eq!(*tree.get(a), 1);
+        assert_eq!(*tree.get(b), 2);
+
+        tree.set(b, 1);
+        assert_eq!(*tree.get(a), 1);
+        assert_eq!(*tree.get(b), 1);
+
+        tree.set(c, 3);
+        tree.set(d, 3);
+        assert_eq!(*tree.get(c), 3);
+        assert_eq!(*tree.get(d), 3);
+
+        tree.set(c, 1);
+        assert_eq!(*tree.get(c), 1);
+        assert_eq!(*tree.get(d), 3);
+
+        tree.set(a, 0);
+        tree.set(b, 0);
+        assert_eq!(*tree.get(a), 0);
+        assert_eq!(*tree.get(b), 0);
+        assert_eq!(*tree.get(c), 1);
+        assert_eq!(*tree.get(d), 3);
     }
 }
