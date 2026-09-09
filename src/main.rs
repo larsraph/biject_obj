@@ -21,7 +21,7 @@ fn main() {
         .init_resource::<QuadTemplate>()
         .init_resource::<WorldGrid>()
         .add_systems(Startup, setup)
-        .add_systems(Update, (input, render_grid).chain())
+        .add_systems(Update, (input, game_of_life, render_grid).chain())
         .run();
 }
 
@@ -130,4 +130,56 @@ fn input(
         }
     };
     Ok(())
+}
+
+fn game_of_life(mut w_grid: ResMut<WorldGrid>) {
+    let previous = w_grid.clone();
+
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let pos = IVec2::new(x as i32, y as i32);
+            let cell = previous.get(pos);
+            let mut neighbor_count = 0;
+
+            for offset in [
+                IVec2::new(-1, -1),
+                IVec2::new(0, -1),
+                IVec2::new(1, -1),
+                IVec2::new(-1, 0),
+                IVec2::new(1, 0),
+                IVec2::new(-1, 1),
+                IVec2::new(0, 1),
+                IVec2::new(1, 1),
+            ] {
+                let neighbor_pos = pos + offset;
+                if neighbor_pos.cmplt(IVec2::ZERO).any()
+                    || neighbor_pos.cmpge(IVec2::splat(SIZE as i32)).any()
+                {
+                    continue;
+                }
+                if previous.get(neighbor_pos) == GCell::Set {
+                    neighbor_count += 1;
+                }
+            }
+
+            let new_cell = match cell {
+                GCell::Unset => {
+                    if neighbor_count == 3 {
+                        GCell::Set
+                    } else {
+                        GCell::Unset
+                    }
+                }
+                GCell::Set => {
+                    if neighbor_count == 2 || neighbor_count == 3 {
+                        GCell::Set
+                    } else {
+                        GCell::Unset
+                    }
+                }
+            };
+
+            w_grid.set(pos, new_cell);
+        }
+    }
 }

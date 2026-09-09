@@ -13,7 +13,7 @@ pub const SIZE_POW2: usize = SIZE * SIZE;
 pub type S = ConstPow2Shape2usize<SIZE_LOG2, SIZE_LOG2>;
 pub const SHAPE: S = S {};
 
-#[derive(Resource)]
+#[derive(Resource, Clone)]
 pub struct WorldGrid {
     pub data: Box<[GCell; SIZE_POW2]>,
 }
@@ -35,6 +35,14 @@ impl WorldGrid {
             .flat_map(|y| (0..SIZE).map(move |x| USizeVec2::new(x, y)))
             .filter(|&pos| matches!(self.data[SHAPE.linearize(pos)], GCell::Set))
             .map(|pos| pos.as_ivec2())
+    }
+
+    pub fn get(&self, pos: IVec2) -> GCell {
+        assert!(pos.cmpge(IVec2::ZERO).all());
+        assert!(pos.cmplt(IVec2::splat(SIZE as i32)).all());
+        let pos = pos.as_usizevec2();
+        let index = SHAPE.linearize(pos);
+        self.data[index]
     }
 
     pub fn set(&mut self, pos: IVec2, to: GCell) {
