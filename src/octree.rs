@@ -76,6 +76,7 @@ impl TreeCursor {
         self.index += 1 + child.octant * self.tree_len;
     }
 
+    #[cfg(test)]
     #[track_caller]
     fn descended(mut self, child: &LevelCursor) -> Self {
         self.descend(child);
@@ -198,7 +199,7 @@ where
         TreeCursor::root(D - 1)
     }
 
-    const fn level_root(pos: &UVec3) -> LevelCursor {
+    const fn level_root(pos: &'_ UVec3) -> LevelCursor<'_> {
         LevelCursor::root(D, pos)
     }
 

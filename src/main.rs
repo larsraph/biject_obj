@@ -5,7 +5,10 @@ mod octree;
 mod projection;
 
 use grid::*;
-use projection::*;
+
+// this is a DX thing b/c it's annoying to have dead code warnings
+pub use octree::Octree;
+pub use projection::solve;
 
 const PX_PER_CELL: u32 = 4;
 
