@@ -110,7 +110,7 @@ fn iter_tuple_idx_pos(shape: &RuntimeShape<u32, 2>) -> impl Iterator<Item = (u32
 }
 
 #[inline]
-fn bilinear(mut vec: Vec2) -> [IVec2; 4] {
+fn bilinear(vec: Vec2) -> [IVec2; 4] {
     let floor = vec.floor();
     let ceil = vec.ceil();
     // row major ordering

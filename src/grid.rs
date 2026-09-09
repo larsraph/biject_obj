@@ -81,16 +81,3 @@ impl WorldGrid {
         }
     }
 }
-
-pub struct Grid {
-    pub data: Vec<GCell>,
-    pub shape: RuntimeShape<u32, 2>,
-}
-
-impl Grid {
-    pub fn new(dims: UVec2) -> Self {
-        let shape = RuntimeShape::<u32, 2>::new(dims.to_array());
-        let data = vec![GCell::Unset; shape.usize()];
-        Self { shape, data }
-    }
-}
