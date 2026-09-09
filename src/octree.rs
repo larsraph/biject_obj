@@ -53,6 +53,9 @@ impl<'a> LevelCursor<'a> {
 }
 
 /// Tracks the `index` and `tree_len` of the level we're on.
+///
+/// Depth-first indexing has persistent state but also should
+/// have singificanly better memory access patterns.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct TreeCursor {
     index: u32,
@@ -92,6 +95,7 @@ impl TreeCursor {
     }
 }
 
+/// A complete tree is one in which every node is present.
 #[derive(Clone, Debug)]
 struct CompleteByteOctree {
     vec: Vec<u8>,
