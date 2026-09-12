@@ -174,21 +174,30 @@ impl<T> OctreeInner<T> {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Octree<T, const D: u32 = 5> {
-    root: T,
+    root: Option<T>,
     inner: Option<OctreeInner<T>>,
+}
+
+impl<T, const D: u32> Default for Octree<T, D> {
+    fn default() -> Self {
+        // The metadata trees require at least one level below their roots.
+        assert!(D >= 3);
+        assert!(D <= 8);
+        Self {
+            root: None,
+            inner: None,
+        }
+    }
 }
 
 impl<T, const D: u32> Octree<T, D>
 where
     T: PartialEq,
 {
-    pub const fn new(root: T) -> Self {
-        // The metadata trees require at least one level below their roots.
-        assert!(D >= 3);
-        assert!(D <= 8);
-        Self { root, inner: None }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     const fn have_root() -> TreeCursor {
@@ -225,14 +234,14 @@ where
         n_level: &mut LevelCursor,
         inherit: &CompleteByteOctree,
         values: &'a HashMap<Key, T>,
-        root: &'a T,
-    ) -> &'a T {
+        root: Option<&'a T>,
+    ) -> Option<&'a T> {
         let mut value = root;
         // Check through the first level below the root; the root itself has no
         // inheritance metadata.
         loop {
             if !inherit.get_child(*p_inherit, *n_level) {
-                value = values.get(&n_level.key()).unwrap();
+                value = values.get(&n_level.key());
                 break;
             }
 
@@ -246,14 +255,15 @@ where
         value
     }
 
-    pub fn get(&self, pos: UVec3) -> &T {
+    pub fn get(&self, pos: UVec3) -> Option<&T> {
+        let root = self.root.as_ref();
         let Some(OctreeInner {
             values,
             children_have_children: have,
             children_inherit_this: inherit,
         }) = &self.inner
         else {
-            return &self.root;
+            return root;
         };
 
         let mut p_have = Self::have_root();
@@ -261,7 +271,7 @@ where
         let mut n_level = Self::level_root(&pos).descended();
 
         Self::scan_have(&mut p_have, &mut p_inherit, &mut n_level, have);
-        Self::scan_inheritance(&mut p_inherit, &mut n_level, inherit, values, &self.root)
+        Self::scan_inheritance(&mut p_inherit, &mut n_level, inherit, values, root)
 
         // PSEUDO CODE
         //
@@ -275,7 +285,8 @@ where
         // this node must exist in the map so we unwrap it and return it
     }
 
-    pub fn set(&mut self, pos: UVec3, value: T) {
+    pub fn set(&mut self, pos: UVec3, value: Option<T>) {
+        let root = self.root.as_ref();
         let OctreeInner {
             values,
             children_have_children: have,
@@ -304,8 +315,8 @@ where
             base_n_level = n_level;
 
             let old_value =
-                Self::scan_inheritance(&mut p_inherit, &mut n_level, inherit, values, &self.root);
-            if *old_value == value {
+                Self::scan_inheritance(&mut p_inherit, &mut n_level, inherit, values, root);
+            if old_value == value.as_ref() {
                 return;
             }
         }
@@ -331,8 +342,8 @@ where
                         }
 
                         let key = n_level.key().with_octant(octant);
-                        let other_value = values.get(&key).unwrap();
-                        if *other_value == value {
+                        let other_value = values.get(&key);
+                        if other_value == value.as_ref() {
                             values.remove(&key);
                             let mut sibling = n_level;
                             sibling.octant = octant;
@@ -373,21 +384,15 @@ where
 
                     // for now this is copy-pasta but we should dedupe this code.
                     let parent_value = if base_n_level.level == D - 1 {
-                        &self.root
+                        root
                     } else {
                         let mut n_level = base_n_level.ascended();
                         let mut p_inherit = base_p_inherit.ascended(&n_level);
-                        Self::scan_inheritance(
-                            &mut p_inherit,
-                            &mut n_level,
-                            inherit,
-                            values,
-                            &self.root,
-                        )
+                        Self::scan_inheritance(&mut p_inherit, &mut n_level, inherit, values, root)
                     };
 
-                    if *parent_value == value {
-                        values.remove(&base_n_level.key()).unwrap();
+                    if parent_value == value.as_ref() {
+                        values.remove(&base_n_level.key());
                         inherit.set_child(base_p_inherit, base_n_level, true);
 
                         let mut p_inherit = base_p_inherit;
@@ -416,7 +421,11 @@ where
                         }
                     } else {
                         inherit.set_child(p_inherit, n_level, false);
-                        values.insert(n_level.key(), value);
+                        if let Some(value) = value {
+                            values.insert(n_level.key(), value);
+                        } else {
+                            values.remove(&n_level.key());
+                        }
                     }
                     return;
                 }
@@ -430,17 +439,11 @@ where
                     let parent_value = {
                         let mut n_level = base_n_level.ascended();
                         let mut p_inherit = base_p_inherit.ascended(&n_level);
-                        Self::scan_inheritance(
-                            &mut p_inherit,
-                            &mut n_level,
-                            inherit,
-                            values,
-                            &self.root,
-                        )
+                        Self::scan_inheritance(&mut p_inherit, &mut n_level, inherit, values, root)
                     };
 
-                    if *parent_value == value {
-                        values.remove(&base_n_level.key()).unwrap();
+                    if parent_value == value.as_ref() {
+                        values.remove(&base_n_level.key());
                         inherit.set_child(base_p_inherit, base_n_level, true);
 
                         // l1 has an implicit 0x00 for the have byte indicating that all l0 nodes are leafs
@@ -474,7 +477,11 @@ where
                 } else {
                     inherit.set_child(base_p_inherit, base_n_level, false);
                 }
-                values.insert(base_n_level.key(), value);
+                if let Some(value) = value {
+                    values.insert(base_n_level.key(), value);
+                } else {
+                    values.remove(&base_n_level.key());
+                }
             }
         } else {
             let mut p_have = base_p_have;
@@ -489,7 +496,9 @@ where
                 n_level.descend();
             }
 
-            values.insert(n_level.key(), value);
+            if let Some(value) = value {
+                values.insert(n_level.key(), value);
+            }
             inherit.set_child(p_inherit, n_level, false);
         }
 
@@ -693,23 +702,23 @@ mod tests {
 
     #[test]
     fn octree_get_returns_root_and_set_values() {
-        let mut tree = Octree::<u8, 3>::new(0);
+        let mut tree = Octree::<u8, 3>::new();
         let first = UVec3::new(0, 0, 0);
         let second = UVec3::new(7, 3, 5);
 
-        assert_eq!(*tree.get(first), 0);
-        assert_eq!(*tree.get(second), 0);
+        assert_eq!(tree.get(first), None);
+        assert_eq!(tree.get(second), None);
 
-        tree.set(first, 1);
-        tree.set(second, 2);
+        tree.set(first, Some(1));
+        tree.set(second, Some(2));
 
-        assert_eq!(*tree.get(first), 1);
-        assert_eq!(*tree.get(second), 2);
+        assert_eq!(tree.get(first), Some(&1));
+        assert_eq!(tree.get(second), Some(&2));
     }
 
     #[test]
     fn octree_preserves_values_for_all_octants() {
-        let mut tree = Octree::<u8, 3>::new(0);
+        let mut tree = Octree::<u8, 3>::new();
 
         for octant in 0..8 {
             let pos = UVec3::new(
@@ -717,7 +726,7 @@ mod tests {
                 ((octant >> 1) & 1) * 4,
                 ((octant >> 2) & 1) * 4,
             );
-            tree.set(pos, octant as u8 + 1);
+            tree.set(pos, Some(octant as u8 + 1));
         }
 
         for octant in 0..8 {
@@ -726,13 +735,13 @@ mod tests {
                 ((octant >> 1) & 1) * 4,
                 ((octant >> 2) & 1) * 4,
             );
-            assert_eq!(*tree.get(pos), octant as u8 + 1);
+            assert_eq!(tree.get(pos), Some(octant as u8 + 1).as_ref());
         }
     }
 
     #[test]
     fn octree_round_trips_deterministic_random_volume() {
-        let mut tree = Octree::<u8, 3>::new(0);
+        let mut tree = Octree::<u8, 3>::new();
         let mut expected = [0u8; 64];
         let mut state = 0x9e37_79b9u32;
 
@@ -747,7 +756,7 @@ mod tests {
                 ((index / 4) % 4) as u32,
                 (index / 16) as u32,
             );
-            tree.set(pos, value);
+            tree.set(pos, Some(value));
 
             for (check_index, &expected_value) in expected.iter().enumerate().take(index + 1) {
                 let check_pos = UVec3::new(
@@ -756,8 +765,8 @@ mod tests {
                     (check_index / 16) as u32,
                 );
                 assert_eq!(
-                    *tree.get(check_pos),
-                    expected_value,
+                    tree.get(check_pos),
+                    Some(&expected_value),
                     "first mismatch after setting index {index}, checking {check_index} at {check_pos:?}"
                 );
             }
@@ -770,7 +779,7 @@ mod tests {
                 ((index / 4) % 4) as u32,
                 (index / 16) as u32,
             );
-            *value = *tree.get(pos);
+            *value = *tree.get(pos).unwrap();
         }
 
         assert_eq!(round_trip, expected);
@@ -778,65 +787,65 @@ mod tests {
 
     #[test]
     fn octree_set_exercises_merge_transitions() {
-        let mut tree = Octree::<u8, 3>::new(0);
+        let mut tree = Octree::<u8, 3>::new();
         let a = UVec3::new(0, 0, 0);
         let b = UVec3::new(0, 0, 1);
         let c = UVec3::new(0, 1, 0);
         let d = UVec3::new(0, 1, 1);
 
-        tree.set(a, 1);
-        assert_eq!(*tree.get(a), 1);
+        tree.set(a, Some(1));
+        assert_eq!(tree.get(a), Some(&1));
 
-        tree.set(b, 2);
-        assert_eq!(*tree.get(a), 1);
-        assert_eq!(*tree.get(b), 2);
+        tree.set(b, Some(2));
+        assert_eq!(tree.get(a), Some(&1));
+        assert_eq!(tree.get(b), Some(&2));
 
-        tree.set(b, 1);
-        assert_eq!(*tree.get(a), 1);
-        assert_eq!(*tree.get(b), 1);
+        tree.set(b, Some(1));
+        assert_eq!(tree.get(a), Some(&1));
+        assert_eq!(tree.get(b), Some(&1));
 
-        tree.set(c, 3);
-        tree.set(d, 3);
-        assert_eq!(*tree.get(c), 3);
-        assert_eq!(*tree.get(d), 3);
+        tree.set(c, Some(3));
+        tree.set(d, Some(3));
+        assert_eq!(tree.get(c), Some(&3));
+        assert_eq!(tree.get(d), Some(&3));
 
-        tree.set(c, 1);
-        assert_eq!(*tree.get(c), 1);
-        assert_eq!(*tree.get(d), 3);
+        tree.set(c, Some(1));
+        assert_eq!(tree.get(c), Some(&1));
+        assert_eq!(tree.get(d), Some(&3));
 
-        tree.set(a, 0);
-        tree.set(b, 0);
-        assert_eq!(*tree.get(a), 0);
-        assert_eq!(*tree.get(b), 0);
-        assert_eq!(*tree.get(c), 1);
-        assert_eq!(*tree.get(d), 3);
+        tree.set(a, Some(0));
+        tree.set(b, Some(0));
+        assert_eq!(tree.get(a), Some(&0));
+        assert_eq!(tree.get(b), Some(&0));
+        assert_eq!(tree.get(c), Some(&1));
+        assert_eq!(tree.get(d), Some(&3));
     }
 
     #[test]
     fn octree_reads_value_promoted_to_root_child() {
-        let mut tree = Octree::<u8, 3>::new(0);
+        let mut tree = Octree::<u8, 3>::new();
 
         for z in 0..2 {
             for y in 0..2 {
                 for x in 0..2 {
-                    tree.set(UVec3::new(x, y, z), 7);
+                    tree.set(UVec3::new(x, y, z), Some(7));
                 }
             }
         }
 
-        assert_eq!(*tree.get(UVec3::new(0, 0, 0)), 7);
-        assert_eq!(*tree.get(UVec3::new(1, 1, 1)), 7);
-        assert_eq!(*tree.get(UVec3::new(2, 0, 0)), 0);
+        assert_eq!(tree.get(UVec3::new(0, 0, 0)), Some(&7));
+        assert_eq!(tree.get(UVec3::new(1, 1, 1)), Some(&7));
+        assert_eq!(tree.get(UVec3::new(2, 0, 0)), None);
     }
 
     #[test]
     fn octree_collapses_to_root_after_restoring_every_cell() {
-        let mut tree = Octree::<u8, 3>::new(0);
+        let mut tree = Octree::<u8, 3>::new();
 
         for z in 0..4 {
             for y in 0..4 {
                 for x in 0..4 {
-                    tree.set(UVec3::new(x, y, z), 5);
+                    tree.set(UVec3::new(x, y, z), Some(5));
                 }
             }
         }
@@ -844,42 +853,42 @@ mod tests {
         for z in 0..4 {
             for y in 0..4 {
                 for x in 0..4 {
-                    tree.set(UVec3::new(x, y, z), 0);
+                    tree.set(UVec3::new(x, y, z), None);
                 }
             }
         }
 
         assert!(tree.inner.is_none());
-        assert_eq!(*tree.get(UVec3::new(3, 3, 3)), 0);
+        assert_eq!(tree.get(UVec3::new(3, 3, 3)), None);
     }
 
     #[test]
     fn octree_repeated_same_value_writes_are_idempotent() {
-        let mut tree = Octree::<u8, 3>::new(0);
+        let mut tree = Octree::<u8, 3>::new();
         let pos = UVec3::new(3, 5, 6);
 
         for _ in 0..8 {
-            tree.set(pos, 9);
-            assert_eq!(*tree.get(pos), 9);
+            tree.set(pos, Some(9));
+            assert_eq!(tree.get(pos), Some(&9));
         }
 
-        tree.set(pos, 0);
-        tree.set(pos, 0);
-        assert_eq!(*tree.get(pos), 0);
+        tree.set(pos, None);
+        tree.set(pos, None);
+        assert_eq!(tree.get(pos), None);
     }
 
     #[test]
     fn octree_promotes_through_explicit_parent_without_losing_siblings() {
-        let mut tree = Octree::<u8, 3>::new(0);
+        let mut tree = Octree::<u8, 3>::new();
         let target = UVec3::new(0, 0, 0);
         let sibling = UVec3::new(0, 0, 1);
 
-        tree.set(target, 1);
-        tree.set(sibling, 2);
-        tree.set(target, 2);
+        tree.set(target, Some(1));
+        tree.set(sibling, Some(2));
+        tree.set(target, Some(2));
 
-        assert_eq!(*tree.get(target), 2);
-        assert_eq!(*tree.get(sibling), 2);
-        assert_eq!(*tree.get(UVec3::new(0, 1, 0)), 0);
+        assert_eq!(tree.get(target), Some(&2));
+        assert_eq!(tree.get(sibling), Some(&2));
+        assert_eq!(tree.get(UVec3::new(0, 1, 0)), None);
     }
 }
