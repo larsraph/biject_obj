@@ -44,12 +44,6 @@ impl<'a> LevelCursor<'a> {
         self.level += 1;
         self.octant = get_octant(*self.pos, self.level);
     }
-
-    #[track_caller]
-    fn ascended(mut self) -> Self {
-        self.ascend();
-        self
-    }
 }
 
 /// Tracks the `index` and `tree_len` of the level we're on.
@@ -88,12 +82,26 @@ impl TreeCursor {
         self.index -= 1 + this.octant * self.tree_len;
         self.tree_len = self.tree_len * 8 + 1;
     }
+}
 
-    #[track_caller]
-    fn ascended(mut self, this: &LevelCursor) -> Self {
-        self.ascend(this);
-        self
-    }
+#[track_caller]
+fn descend_all(p_have: &mut TreeCursor, p_inherit: &mut TreeCursor, n_level: &mut LevelCursor) {
+    p_have.descend(n_level);
+    p_inherit.descend(n_level);
+    n_level.descend();
+}
+
+#[track_caller]
+fn ascend_inheritance(p_inherit: &mut TreeCursor, n_level: &mut LevelCursor) {
+    n_level.ascend();
+    p_inherit.ascend(n_level);
+}
+
+#[track_caller]
+fn ascend_all(p_have: &mut TreeCursor, p_inherit: &mut TreeCursor, n_level: &mut LevelCursor) {
+    n_level.ascend();
+    p_inherit.ascend(n_level);
+    p_have.ascend(n_level);
 }
 
 /// A complete tree is one in which every node is present.
@@ -226,9 +234,7 @@ where
                 break;
             }
 
-            p_have.descend(&n_level);
-            p_inherit.descend(&n_level);
-            n_level.descend();
+            descend_all(p_have, p_inherit, n_level);
         }
     }
 
@@ -252,8 +258,7 @@ where
                 break;
             }
 
-            n_level.ascend();
-            p_inherit.ascend(&n_level);
+            ascend_inheritance(p_inherit, n_level);
         }
         value
     }
@@ -364,9 +369,7 @@ where
 
                     let unify = inherit[p_inherit] == 0xFF && have[p_have] == 0x00;
 
-                    n_level.ascend();
-                    p_inherit.ascend(&n_level);
-                    p_have.ascend(&n_level);
+                    ascend_all(&mut p_have, &mut p_inherit, &mut n_level);
 
                     if unify {
                         have.clear_child(p_have, n_level);
@@ -389,8 +392,9 @@ where
                     let parent_value = if base_n_level.level == D - 1 {
                         root
                     } else {
-                        let mut n_level = base_n_level.ascended();
-                        let mut p_inherit = base_p_inherit.ascended(&n_level);
+                        let mut n_level = base_n_level;
+                        let mut p_inherit = base_p_inherit;
+                        ascend_inheritance(&mut p_inherit, &mut n_level);
                         Self::scan_inheritance(&mut p_inherit, &mut n_level, inherit, values, root)
                     };
 
@@ -416,9 +420,7 @@ where
                                 return;
                             }
 
-                            n_level.ascend();
-                            p_inherit.ascend(&n_level);
-                            p_have.ascend(&n_level);
+                            ascend_all(&mut p_have, &mut p_inherit, &mut n_level);
 
                             have.clear_child(p_have, n_level);
                         }
@@ -440,8 +442,9 @@ where
                 if !inheritor {
                     // check the chain of inheritance of the parent
                     let parent_value = {
-                        let mut n_level = base_n_level.ascended();
-                        let mut p_inherit = base_p_inherit.ascended(&n_level);
+                        let mut n_level = base_n_level;
+                        let mut p_inherit = base_p_inherit;
+                        ascend_inheritance(&mut p_inherit, &mut n_level);
                         Self::scan_inheritance(&mut p_inherit, &mut n_level, inherit, values, root)
                     };
 
@@ -468,9 +471,7 @@ where
                                 return;
                             }
 
-                            n_level.ascend();
-                            p_inherit.ascend(&n_level);
-                            p_have.ascend(&n_level);
+                            ascend_all(&mut p_have, &mut p_inherit, &mut n_level);
 
                             have.clear_child(p_have, n_level);
                             have_val = have[p_have];
@@ -494,9 +495,7 @@ where
             while n_level.level != 0 {
                 have.set_child(p_have, n_level);
 
-                p_have.descend(&n_level);
-                p_inherit.descend(&n_level);
-                n_level.descend();
+                descend_all(&mut p_have, &mut p_inherit, &mut n_level);
             }
 
             if let Some(value) = value {
@@ -651,6 +650,31 @@ mod tests {
     }
 
     #[test]
+    fn coordinated_cursor_helpers_preserve_independent_depths() {
+        let pos = UVec3::ZERO;
+        let mut have = TreeCursor::root(2);
+        let mut inherit = TreeCursor::root(3);
+        let mut level = LevelCursor::root(4, &pos).descended();
+
+        descend_all(&mut have, &mut inherit, &mut level);
+
+        let mut expected_have = TreeCursor::root(2);
+        let mut expected_inherit = TreeCursor::root(3);
+        let mut expected_level = LevelCursor::root(4, &pos).descended();
+        expected_have.descend(&expected_level);
+        expected_inherit.descend(&expected_level);
+        expected_level.descend();
+        assert_eq!(
+            (have, inherit, level),
+            (expected_have, expected_inherit, expected_level)
+        );
+
+        let have_before = have;
+        ascend_inheritance(&mut inherit, &mut level);
+        assert_eq!(have, have_before);
+    }
+
+    #[test]
     fn cursor_indexes_all_nodes_once() {
         fn visit(cursor: TreeCursor, depth: u32, indexes: &mut Vec<u32>) {
             indexes.push(cursor.index);
@@ -686,8 +710,8 @@ mod tests {
         let child3 = LevelCursor::root(2, &pos3).descended();
         let child5 = LevelCursor::root(2, &pos5).descended();
 
-        tree.set_child(root, child3, true);
-        tree.set_child(root, child5, true);
+        tree.set_child(root, child3);
+        tree.set_child(root, child5);
 
         assert!(tree.get_child(root, child3));
         assert!(tree.get_child(root, child5));
