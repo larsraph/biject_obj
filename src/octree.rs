@@ -9,8 +9,8 @@ use bevy::{
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct LevelCursor<'a> {
     level: u32,
-    pos: &'a UVec3,
     octant: u32,
+    pos: &'a UVec3,
 }
 
 impl<'a> LevelCursor<'a> {
@@ -54,7 +54,7 @@ impl<'a> LevelCursor<'a> {
 
 /// Tracks the `index` and `tree_len` of the level we're on.
 ///
-/// Depth-first indexing has persistent state but also should
+/// Depth-first indexing requires persistent state but also should
 /// have singificanly better memory access patterns.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct TreeCursor {
@@ -76,7 +76,6 @@ impl TreeCursor {
         self.index += 1 + child.octant * self.tree_len;
     }
 
-    #[cfg(test)]
     #[track_caller]
     fn descended(mut self, child: &LevelCursor) -> Self {
         self.descend(child);
@@ -109,14 +108,16 @@ impl CompleteByteOctree {
         Self { vec }
     }
 
-    #[track_caller]
     fn get_child(&self, cursor: TreeCursor, child: LevelCursor) -> bool {
-        get_child(&self[cursor], child.octant)
+        get_bit(&self[cursor], child.octant)
     }
 
-    #[track_caller]
-    fn set_child(&mut self, cursor: TreeCursor, child: LevelCursor, value: bool) {
-        set_child(&mut self[cursor], child.octant, value);
+    fn set_child(&mut self, cursor: TreeCursor, child: LevelCursor) {
+        set_bit(&mut self[cursor], child.octant);
+    }
+
+    fn clear_child(&mut self, cursor: TreeCursor, child: LevelCursor) {
+        clear_bit(&mut self[cursor], child.octant);
     }
 }
 
@@ -143,16 +144,17 @@ struct Key {
 impl Key {
     fn new(pos: UVec3, level: u32) -> Self {
         let level = level as u8;
-        let pos = (pos >> level).as_u8vec3();
+        let pos = pos.as_u8vec3() >> level;
         Self { level, pos }
     }
 
     fn with_octant(mut self, octant: u32) -> Self {
+        let octant = octant as u8;
         let x = octant & 1;
         let y = (octant >> 1) & 1;
         let z = (octant >> 2) & 1;
         self.pos &= !1;
-        self.pos |= UVec3::new(x, y, z).as_u8vec3();
+        self.pos |= U8Vec3::new(x, y, z);
         self
     }
 }
@@ -182,7 +184,6 @@ pub struct Octree<T, const D: u32 = 5> {
 
 impl<T, const D: u32> Default for Octree<T, D> {
     fn default() -> Self {
-        // The metadata trees require at least one level below their roots.
         assert!(D >= 3);
         assert!(D <= 8);
         Self {
@@ -212,6 +213,7 @@ where
         LevelCursor::root(D, pos)
     }
 
+    /// Walks the `children_have_children` tree until a node doesn't have children.
     fn scan_have(
         p_have: &mut TreeCursor,
         p_inherit: &mut TreeCursor,
@@ -347,7 +349,7 @@ where
                             values.remove(&key);
                             let mut sibling = n_level;
                             sibling.octant = octant;
-                            inherit.set_child(p_inherit, sibling, true);
+                            inherit.set_child(p_inherit, sibling);
                         }
                     }
 
@@ -366,7 +368,7 @@ where
                     p_have.ascend(&n_level);
 
                     if unify {
-                        have.set_child(p_have, n_level, false);
+                        have.clear_child(p_have, n_level);
                     }
 
                     once = true;
@@ -393,7 +395,7 @@ where
 
                     if parent_value == value.as_ref() {
                         values.remove(&base_n_level.key());
-                        inherit.set_child(base_p_inherit, base_n_level, true);
+                        inherit.set_child(base_p_inherit, base_n_level);
 
                         let mut p_inherit = base_p_inherit;
                         let mut p_have = base_p_have;
@@ -417,10 +419,10 @@ where
                             p_inherit.ascend(&n_level);
                             p_have.ascend(&n_level);
 
-                            have.set_child(p_have, n_level, false);
+                            have.clear_child(p_have, n_level);
                         }
                     } else {
-                        inherit.set_child(p_inherit, n_level, false);
+                        inherit.clear_child(p_inherit, n_level);
                         if let Some(value) = value {
                             values.insert(n_level.key(), value);
                         } else {
@@ -444,7 +446,7 @@ where
 
                     if parent_value == value.as_ref() {
                         values.remove(&base_n_level.key());
-                        inherit.set_child(base_p_inherit, base_n_level, true);
+                        inherit.set_child(base_p_inherit, base_n_level);
 
                         // l1 has an implicit 0x00 for the have byte indicating that all l0 nodes are leafs
                         let mut have_val = 0x00;
@@ -469,13 +471,13 @@ where
                             p_inherit.ascend(&n_level);
                             p_have.ascend(&n_level);
 
-                            have.set_child(p_have, n_level, false);
+                            have.clear_child(p_have, n_level);
                             have_val = have[p_have];
                         }
                         return;
                     }
                 } else {
-                    inherit.set_child(base_p_inherit, base_n_level, false);
+                    inherit.clear_child(base_p_inherit, base_n_level);
                 }
                 if let Some(value) = value {
                     values.insert(base_n_level.key(), value);
@@ -489,7 +491,7 @@ where
             let mut n_level = base_n_level;
 
             while n_level.level != 0 {
-                have.set_child(p_have, n_level, true);
+                have.set_child(p_have, n_level);
 
                 p_have.descend(&n_level);
                 p_inherit.descend(&n_level);
@@ -499,7 +501,7 @@ where
             if let Some(value) = value {
                 values.insert(n_level.key(), value);
             }
-            inherit.set_child(p_inherit, n_level, false);
+            inherit.clear_child(p_inherit, n_level);
         }
 
         // FIRST if we don't have any inner AND the value is the same as the root, do nothing
@@ -598,16 +600,16 @@ fn get_octant(mut pos: UVec3, level: u32) -> u32 {
     pos.x | pos.y << 1 | pos.z << 2
 }
 
-const fn get_child(byte: &u8, octant: u32) -> bool {
+const fn get_bit(byte: &u8, octant: u32) -> bool {
     (*byte >> octant) & 1 != 0
 }
 
-const fn set_child(byte: &mut u8, octant: u32, value: bool) {
-    if value {
-        *byte |= 1 << octant;
-    } else {
-        *byte &= !(1 << octant);
-    }
+const fn set_bit(byte: &mut u8, octant: u32) {
+    *byte |= 1 << octant;
+}
+
+const fn clear_bit(byte: &mut u8, octant: u32) {
+    *byte &= !(1 << octant);
 }
 
 /// unreviewed AI tests.
