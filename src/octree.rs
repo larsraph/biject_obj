@@ -293,6 +293,7 @@ where
         // this node must exist in the map so we unwrap it and return it
     }
 
+    // TODO: add invariant that None values cannot be inherited.
     pub fn set(&mut self, pos: UVec3, value: Option<T>) {
         let root = self.root.as_ref();
         let OctreeInner {
