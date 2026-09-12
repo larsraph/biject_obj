@@ -1,5 +1,5 @@
 use bevy::{math::USizeVec2, prelude::*};
-use ndshape::{ConstPow2Shape2usize, RuntimeShape, Shape as _};
+use ndshape::{ConstPow2Shape2usize, Shape as _};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GCell {
