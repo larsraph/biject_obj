@@ -1,6 +1,8 @@
 use bevy::{math::USizeVec2, prelude::*};
 use ndshape::{ConstPow2Shape2usize, Shape as _};
 
+use crate::connectivity::Connectivity;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GCell {
     Set,
@@ -14,6 +16,7 @@ pub type S = ConstPow2Shape2usize<SIZE_LOG2, SIZE_LOG2>;
 pub const SHAPE: S = S {};
 
 #[derive(Resource, Clone)]
+#[require(Connectivity)]
 pub struct WorldGrid {
     pub data: Box<[GCell; SIZE_POW2]>,
 }
@@ -65,6 +68,45 @@ impl WorldGrid {
             if cell.cmpge(IVec2::ZERO).all() && cell.cmplt(IVec2::splat(SIZE as i32)).all() {
                 self.set(cell, to);
             }
+            if cell == end {
+                break;
+            }
+
+            let twice_error = 2 * error;
+            if twice_error > -delta.y {
+                error -= delta.y;
+                cell.x += step.x;
+            }
+            if twice_error < delta.x {
+                error += delta.x;
+                cell.y += step.y;
+            }
+        }
+    }
+
+    pub fn set_brush(&mut self, center: Vec2, radius: i32, to: GCell) {
+        let center = center.round().as_ivec2();
+        for y in -radius..=radius {
+            for x in -radius..=radius {
+                let cell = center + IVec2::new(x, y);
+                if cell.cmpge(IVec2::ZERO).all()
+                    && cell.cmplt(IVec2::splat(SIZE as i32)).all()
+                {
+                    self.set(cell, to);
+                }
+            }
+        }
+    }
+
+    pub fn set_brush_line(&mut self, start: Vec2, end: Vec2, radius: i32, to: GCell) {
+        let mut cell = start.round().as_ivec2();
+        let end = end.round().as_ivec2();
+        let delta = (end - cell).abs();
+        let step = (end - cell).signum();
+        let mut error = delta.x - delta.y;
+
+        loop {
+            self.set_brush(cell.as_vec2(), radius, to);
             if cell == end {
                 break;
             }

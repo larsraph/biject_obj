@@ -1,5 +1,6 @@
 use bevy::{camera::ScalingMode, prelude::*};
 
+mod connectivity;
 mod grid;
 mod octree;
 mod projection;
@@ -10,7 +11,10 @@ use grid::*;
 pub use octree::Octree;
 pub use projection::solve;
 
+use crate::connectivity::{Connectivity, set_brush, set_brush_line};
+
 const PX_PER_CELL: u32 = 4;
+const INITIAL_BRUSH_RADIUS: i32 = 4;
 
 fn main() {
     App::new()
@@ -23,8 +27,9 @@ fn main() {
         }))
         .init_resource::<QuadTemplate>()
         .init_resource::<WorldGrid>()
+        .init_resource::<Brush>()
         .add_systems(Startup, setup)
-        .add_systems(Update, (input, game_of_life, render_grid).chain())
+        .add_systems(Update, (input, render_grid).chain())
         .run();
 }
 
@@ -49,6 +54,19 @@ struct QuadTemplate(QuadBundle);
 
 #[derive(Component)]
 struct Quad;
+
+#[derive(Resource)]
+struct Brush {
+    radius: i32,
+}
+
+impl Default for Brush {
+    fn default() -> Self {
+        Self {
+            radius: INITIAL_BRUSH_RADIUS,
+        }
+    }
+}
 
 fn setup(mut commands: Commands) {
     commands.spawn((
@@ -94,10 +112,20 @@ fn render_grid(
 fn input(
     window: Single<&Window>,
     camera: Single<(&Camera, &GlobalTransform)>,
-    mut w_grid: ResMut<WorldGrid>,
+    w_grid: Single<(&mut WorldGrid, &mut Connectivity)>,
     mbi: Res<ButtonInput<MouseButton>>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut brush: ResMut<Brush>,
     mut last: Local<Option<(GCell, Vec2)>>,
 ) -> Result<(), BevyError> {
+    if keyboard.just_pressed(KeyCode::Equal) || keyboard.just_pressed(KeyCode::NumpadAdd) {
+        brush.radius += 1;
+    }
+    if keyboard.just_pressed(KeyCode::Minus) || keyboard.just_pressed(KeyCode::NumpadSubtract) {
+        brush.radius = (brush.radius - 1).max(1);
+    }
+
+    let (mut w_grid, mut connectivity) = w_grid.into_inner();
     let lmb = mbi.pressed(MouseButton::Left);
     let rmb = mbi.pressed(MouseButton::Right);
 
@@ -120,7 +148,14 @@ fn input(
                 _ => {}
             }
 
-            w_grid.set_line(*lpos, pos, *mode);
+            set_brush_line(
+                &mut *w_grid,
+                &mut *connectivity,
+                *lpos,
+                pos,
+                brush.radius,
+                *mode,
+            );
 
             *lpos = pos;
         } else {
@@ -129,7 +164,13 @@ fn input(
             let mode = if lmb { GCell::Set } else { GCell::Unset };
             *last = Some((mode, pos));
 
-            w_grid.set(pos.round().as_ivec2(), mode)
+            set_brush(
+                &mut *w_grid,
+                &mut *connectivity,
+                pos,
+                brush.radius,
+                mode,
+            )
         }
     };
     Ok(())
