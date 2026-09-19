@@ -16,7 +16,6 @@ pub type S = ConstPow2Shape2usize<SIZE_LOG2, SIZE_LOG2>;
 pub const SHAPE: S = S {};
 
 #[derive(Resource, Clone)]
-#[require(Connectivity)]
 pub struct WorldGrid {
     pub data: Box<[GCell; SIZE_POW2]>,
 }
@@ -89,9 +88,7 @@ impl WorldGrid {
         for y in -radius..=radius {
             for x in -radius..=radius {
                 let cell = center + IVec2::new(x, y);
-                if cell.cmpge(IVec2::ZERO).all()
-                    && cell.cmplt(IVec2::splat(SIZE as i32)).all()
-                {
+                if cell.cmpge(IVec2::ZERO).all() && cell.cmplt(IVec2::splat(SIZE as i32)).all() {
                     self.set(cell, to);
                 }
             }

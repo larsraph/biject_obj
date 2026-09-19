@@ -1,16 +1,10 @@
 use bevy::prelude::*;
 
-mod connectivity;
 mod grid;
-mod octree;
 mod projection;
 mod render;
 
 use grid::*;
-
-// this is a DX thing b/c it's annoying to have dead code warnings
-pub use octree::Octree;
-pub use projection::solve;
 
 use crate::render::{render, render_setup};
 
