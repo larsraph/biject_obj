@@ -45,6 +45,8 @@ pub fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3A
     }
 
     solver.solve(&mut solution, false, None).unwrap();
+
+    // TODO: unfortunately this invariant is NOT currently upheld by our solver.
     assert_eq!(solution.num_unassigned, 0);
 
     Solution {

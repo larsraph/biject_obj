@@ -1,8 +1,6 @@
 use bevy::{math::USizeVec2, prelude::*};
 use ndshape::{ConstPow2Shape2usize, Shape as _};
 
-use crate::connectivity::Connectivity;
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GCell {
     Set,
@@ -40,16 +38,14 @@ impl WorldGrid {
     }
 
     pub fn get(&self, pos: IVec2) -> GCell {
-        assert!(pos.cmpge(IVec2::ZERO).all());
-        assert!(pos.cmplt(IVec2::splat(SIZE as i32)).all());
+        assert!(contains(pos));
         let pos = pos.as_usizevec2();
         let index = SHAPE.linearize(pos);
         self.data[index]
     }
 
     pub fn set(&mut self, pos: IVec2, to: GCell) {
-        assert!(pos.cmpge(IVec2::ZERO).all());
-        assert!(pos.cmplt(IVec2::splat(SIZE as i32)).all());
+        assert!(contains(pos));
         let pos = pos.as_usizevec2();
         let index = SHAPE.linearize(pos);
         self.data[index] = to;
@@ -64,7 +60,7 @@ impl WorldGrid {
         let mut error = delta.x - delta.y;
 
         loop {
-            if cell.cmpge(IVec2::ZERO).all() && cell.cmplt(IVec2::splat(SIZE as i32)).all() {
+            if contains(cell) {
                 self.set(cell, to);
             }
             if cell == end {
@@ -88,7 +84,7 @@ impl WorldGrid {
         for y in -radius..=radius {
             for x in -radius..=radius {
                 let cell = center + IVec2::new(x, y);
-                if cell.cmpge(IVec2::ZERO).all() && cell.cmplt(IVec2::splat(SIZE as i32)).all() {
+                if contains(cell) {
                     self.set(cell, to);
                 }
             }
@@ -119,4 +115,8 @@ impl WorldGrid {
             }
         }
     }
+}
+
+fn contains(pos: IVec2) -> bool {
+    pos.cmpge(IVec2::ZERO).all() && pos.cmplt(IVec2::splat(SIZE as i32)).all()
 }

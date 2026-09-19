@@ -37,7 +37,6 @@ impl FromWorld for QuadBundle {
 pub struct Quad;
 
 pub fn render_setup(mut commands: Commands) {
-    commands.init_resource::<QuadTemplate>();
     commands.spawn((
         Camera2d,
         Projection::Orthographic(OrthographicProjection {
