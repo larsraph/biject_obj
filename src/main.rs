@@ -1,9 +1,10 @@
-use bevy::{camera::ScalingMode, prelude::*};
+use bevy::prelude::*;
 
 mod connectivity;
 mod grid;
 mod octree;
 mod projection;
+mod render;
 
 use grid::*;
 
@@ -11,49 +12,19 @@ use grid::*;
 pub use octree::Octree;
 pub use projection::solve;
 
-use crate::connectivity::{Connectivity, set_brush, set_brush_line};
+use crate::render::{render, render_setup};
 
-const PX_PER_CELL: u32 = 4;
 const INITIAL_BRUSH_RADIUS: i32 = 4;
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                resolution: (SIZE as u32 * PX_PER_CELL, SIZE as u32 * PX_PER_CELL).into(),
-                ..default()
-            }),
-            ..default()
-        }))
-        .init_resource::<QuadTemplate>()
+        .add_plugins(DefaultPlugins.set(render::square_window()))
         .init_resource::<WorldGrid>()
         .init_resource::<Brush>()
-        .add_systems(Startup, setup)
-        .add_systems(Update, (input, render_grid).chain())
+        .add_systems(Startup, render_setup)
+        .add_systems(Update, (input, render).chain())
         .run();
 }
-
-#[derive(Bundle, Clone)]
-struct QuadBundle {
-    material: MeshMaterial2d<ColorMaterial>,
-    mesh: Mesh2d,
-}
-
-impl FromWorld for QuadBundle {
-    fn from_world(world: &mut World) -> Self {
-        let asset_server = world.resource::<AssetServer>();
-        QuadBundle {
-            material: MeshMaterial2d(asset_server.add(Color::WHITE.into())),
-            mesh: Mesh2d(asset_server.add(Rectangle::from_length(1.).into())),
-        }
-    }
-}
-
-#[derive(Resource, FromWorld)]
-struct QuadTemplate(QuadBundle);
-
-#[derive(Component)]
-struct Quad;
 
 #[derive(Resource)]
 struct Brush {
@@ -68,51 +39,10 @@ impl Default for Brush {
     }
 }
 
-fn setup(mut commands: Commands) {
-    commands.spawn((
-        Camera2d,
-        Projection::Orthographic(OrthographicProjection {
-            scaling_mode: ScalingMode::Fixed {
-                width: SIZE as f32,
-                height: SIZE as f32,
-            },
-            ..OrthographicProjection::default_2d()
-        }),
-        Transform::from_xyz(SIZE as f32 / 2.0 - 0.5, SIZE as f32 / 2.0 - 0.5, 0.0),
-    ));
-}
-
-fn render_grid(
-    mut commands: Commands,
-    mut quads: Query<(Entity, &mut Transform), With<Quad>>,
-    w_grid: Res<WorldGrid>,
-    template: Res<QuadTemplate>,
-) {
-    let mut recycle = quads.iter_mut();
-    for pos in w_grid.iter_set_positions() {
-        if let Some((_, mut re_trgt)) = recycle.next() {
-            re_trgt.translation = pos.extend(0).as_vec3();
-        } else {
-            commands.spawn((
-                Quad,
-                Transform::from_translation(pos.extend(0).as_vec3()),
-                template.0.clone(),
-            ));
-        }
-    }
-
-    // We either despawn or set `Disabled`.
-    // Despawning is better unless you have non-copy or persistent data
-    // because it doesn't perform an archetype move.
-    for (e, _) in recycle {
-        commands.entity(e).despawn();
-    }
-}
-
 fn input(
     window: Single<&Window>,
     camera: Single<(&Camera, &GlobalTransform)>,
-    w_grid: Single<(&mut WorldGrid, &mut Connectivity)>,
+    mut w_grid: Single<&mut WorldGrid>,
     mbi: Res<ButtonInput<MouseButton>>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut brush: ResMut<Brush>,
@@ -125,7 +55,6 @@ fn input(
         brush.radius = (brush.radius - 1).max(1);
     }
 
-    let (mut w_grid, mut connectivity) = w_grid.into_inner();
     let lmb = mbi.pressed(MouseButton::Left);
     let rmb = mbi.pressed(MouseButton::Right);
 
@@ -148,14 +77,7 @@ fn input(
                 _ => {}
             }
 
-            set_brush_line(
-                &mut *w_grid,
-                &mut *connectivity,
-                *lpos,
-                pos,
-                brush.radius,
-                *mode,
-            );
+            w_grid.set_brush_line(*lpos, pos, brush.radius, *mode);
 
             *lpos = pos;
         } else {
@@ -164,13 +86,7 @@ fn input(
             let mode = if lmb { GCell::Set } else { GCell::Unset };
             *last = Some((mode, pos));
 
-            set_brush(
-                &mut *w_grid,
-                &mut *connectivity,
-                pos,
-                brush.radius,
-                mode,
-            )
+            w_grid.set_brush(pos, brush.radius, mode);
         }
     };
     Ok(())
