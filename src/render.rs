@@ -53,7 +53,7 @@ pub fn render_setup(mut commands: Commands) {
 pub fn render(
     mut commands: Commands,
     mut quads: Query<(Entity, &mut Transform), With<Quad>>,
-    world: Res<WorldGrid>,
+    world: Single<Ref<WorldGrid>>,
     template: Res<QuadTemplate>,
 ) {
     if !world.is_changed() {

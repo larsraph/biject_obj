@@ -25,6 +25,7 @@ pub fn edit(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut brush: ResMut<Brush>,
     mut last: Local<Option<(GCell, Vec2)>>,
+    mut selection_start: Local<Option<IVec2>>,
 ) -> Result<(), BevyError> {
     if keyboard.just_pressed(KeyCode::Equal) || keyboard.just_pressed(KeyCode::NumpadAdd) {
         brush.radius += 1;
@@ -35,8 +36,10 @@ pub fn edit(
 
     let lmb = mbi.pressed(MouseButton::Left);
     let rmb = mbi.pressed(MouseButton::Right);
+    let mmb = mbi.pressed(MouseButton::Middle);
+    let mmb_released = mbi.just_released(MouseButton::Middle);
 
-    if !lmb && !rmb {
+    if !lmb && !rmb && !mmb && !mmb_released {
         *last = None;
         return Ok(());
     }
@@ -46,6 +49,20 @@ pub fn edit(
         let pos = camera
             .viewport_to_world_2d(camera_transform, cursor_position)
             .with_severity(Severity::Warning)?;
+
+        if mmb || mmb_released {
+            *last = None;
+
+            if mmb && selection_start.is_none() {
+                *selection_start = Some(pos.round().as_ivec2());
+            }
+            if mmb_released {
+                if let Some(start) = selection_start.take() {
+                    let _ = world.extract(start, pos.round().as_ivec2());
+                }
+            }
+            return Ok(());
+        }
 
         if let Some((mode, lpos)) = &mut *last {
             // Swap the mode if neccecary

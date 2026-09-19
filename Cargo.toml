@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+avian3d = "0.7.0"
 bevy = { version = "0.19.1", default-features = false, features = ["2d", "ui", "audio", "dynamic_linking", "debug"] }
 bitvec = "1.1.1"
 ndshape = { git = "https://github.com/larsraph/ndshape-rs" }

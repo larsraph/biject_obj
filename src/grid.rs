@@ -1,5 +1,6 @@
+use avian3d::prelude::*;
 use bevy::{math::USizeVec2, prelude::*};
-use ndshape::{ConstPow2Shape2usize, Shape as _};
+use ndshape::{ConstPow2Shape2usize, RuntimeShape, Shape as _};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GCell {
@@ -13,7 +14,7 @@ pub const SIZE_POW2: usize = SIZE * SIZE;
 pub type S = ConstPow2Shape2usize<SIZE_LOG2, SIZE_LOG2>;
 pub const SHAPE: S = S {};
 
-#[derive(Resource, Clone)]
+#[derive(Component, Clone)]
 pub struct WorldGrid {
     pub data: Box<[GCell; SIZE_POW2]>,
 }
@@ -30,6 +31,23 @@ impl Default for WorldGrid {
 }
 
 impl WorldGrid {
+    fn collider(&self) -> Collider {
+        let size = SIZE as i32;
+        let mut voxels = Vec::with_capacity(4 * SIZE + self.iter_set_positions().count());
+
+        for x in -1..=size {
+            voxels.push(IVec3::new(x, -1, 0));
+            voxels.push(IVec3::new(x, size, 0));
+        }
+        for y in 0..size {
+            voxels.push(IVec3::new(-1, y, 0));
+            voxels.push(IVec3::new(size, y, 0));
+        }
+
+        voxels.extend(self.iter_set_positions().map(|position| position.extend(0)));
+        Collider::voxels(Vec3::ONE, &voxels)
+    }
+
     pub fn iter_set_positions(&self) -> impl Iterator<Item = IVec2> + '_ {
         (0..SIZE)
             .flat_map(|y| (0..SIZE).map(move |x| USizeVec2::new(x, y)))
@@ -115,8 +133,81 @@ impl WorldGrid {
             }
         }
     }
+
+    pub fn extract(&mut self, from: IVec2, to: IVec2) -> Option<Grid> {
+        let from = from.min(to);
+        let to = to.max(from);
+        if !contains(from) || !contains(to) {
+            return None;
+        }
+        let from = clamp(from);
+        let to = clamp(to);
+        let size = (to - from + IVec2::ONE).as_uvec2();
+
+        let shape = RuntimeShape::<u32, 2>::new(size);
+        let mut grid = Grid::new(shape);
+
+        let mut once = false;
+        for y in 0..size.y {
+            for x in 0..size.x {
+                let gpos = IVec2::new(x as i32, y as i32);
+                let wpos = gpos + from;
+
+                let value = self.get(wpos);
+                grid.set(gpos, value);
+                self.set(wpos, GCell::Unset);
+
+                if matches!(value, GCell::Set) {
+                    once = true;
+                }
+            }
+        }
+        once.then_some(grid)
+    }
+}
+
+pub fn spawn_world_grid(mut commands: Commands) {
+    let grid = WorldGrid::default();
+    let collider = grid.collider();
+    commands.spawn((grid, RigidBody::Static, collider));
+}
+
+pub fn update_world_grid_collider(
+    collider: Single<(&mut Collider, &WorldGrid), Changed<WorldGrid>>,
+) {
+    let (mut collider, grid) = collider.into_inner();
+    *collider = grid.collider();
 }
 
 fn contains(pos: IVec2) -> bool {
     pos.cmpge(IVec2::ZERO).all() && pos.cmplt(IVec2::splat(SIZE as i32)).all()
+}
+
+fn clamp(pos: IVec2) -> IVec2 {
+    pos.clamp(IVec2::ZERO, IVec2::splat(SIZE as i32))
+}
+
+#[derive(Component)]
+pub struct Grid {
+    data: Vec<GCell>,
+    shape: RuntimeShape<u32, 2>,
+}
+
+impl Grid {
+    pub fn new(shape: RuntimeShape<u32, 2>) -> Self {
+        Self {
+            data: vec![GCell::Unset; shape.usize()],
+            shape,
+        }
+    }
+
+    pub fn set(&mut self, pos: IVec2, cell: GCell) {
+        let index = self.shape.linearize(pos.as_uvec2()) as usize;
+        self.data[index] = cell;
+    }
+
+    pub fn get(&self, pos: IVec2) -> GCell {
+        let index = self.shape.linearize(pos.as_uvec2()) as usize;
+        self.data[index]
+    }
 }
