@@ -7,9 +7,9 @@ mod projection;
 mod render;
 
 use crate::{
-    grid::{spawn_world_grid, update_world_grid_collider},
-    input::{Brush, edit},
-    render::{QuadTemplate, render, render_setup},
+    grid::{recalculate_bijection, spawn_world_grid, update_world_grid_collider},
+    input::{Brush, Selection, draw_selection, edit},
+    render::{QuadTemplate, render_setup, render_world},
 };
 
 fn main() {
@@ -20,7 +20,18 @@ fn main() {
         ))
         .init_resource::<QuadTemplate>()
         .init_resource::<Brush>()
+        .init_resource::<Selection>()
         .add_systems(Startup, (spawn_world_grid, render_setup))
-        .add_systems(Update, (edit, update_world_grid_collider, render).chain())
+        .add_systems(
+            Update,
+            (
+                recalculate_bijection,
+                edit,
+                update_world_grid_collider,
+                render_world,
+                draw_selection,
+            )
+                .chain(),
+        )
         .run();
 }

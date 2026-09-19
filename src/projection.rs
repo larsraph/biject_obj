@@ -47,7 +47,7 @@ pub fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3A
     solver.solve(&mut solution, false, None).unwrap();
 
     // TODO: unfortunately this invariant is NOT currently upheld by our solver.
-    assert_eq!(solution.num_unassigned, 0);
+    // assert_eq!(solution.num_unassigned, 0);
 
     Solution {
         src_to_dst: solution.person_to_object,
@@ -73,6 +73,10 @@ impl Solution {
         }
         let src_idx = self.src_shape.linearize(pos) as usize;
         let dst_idx = self.src_to_dst[src_idx];
+        // TODO: see invariant in solve() that should be upheld
+        if dst_idx == u32::MAX {
+            return None;
+        }
         let local_pos = UVec2::from_array(self.dst_shape.delinearize(dst_idx));
         let pos = local_pos.as_ivec2() + self.dst_origin;
         Some(pos)

@@ -1,6 +1,6 @@
 use bevy::{camera::ScalingMode, prelude::*};
 
-use crate::grid::{SIZE, WorldGrid};
+use crate::grid::{Bijection, Grid, ObjGrid, SIZE, WorldGrid};
 
 const PX_PER_CELL: u32 = 4;
 
@@ -50,18 +50,15 @@ pub fn render_setup(mut commands: Commands) {
     ));
 }
 
-pub fn render(
+pub fn render_world(
     mut commands: Commands,
     mut quads: Query<(Entity, &mut Transform), With<Quad>>,
-    world: Single<Ref<WorldGrid>>,
+    world: Single<&WorldGrid>,
+    obj: Query<(&Grid, &Bijection), With<ObjGrid>>,
     template: Res<QuadTemplate>,
 ) {
-    if !world.is_changed() {
-        return;
-    }
-
     let mut recycle = quads.iter_mut();
-    for pos in world.iter_set_positions() {
+    let mut quad = |pos: IVec2| {
         if let Some((_, mut recycle)) = recycle.next() {
             recycle.translation = pos.extend(0).as_vec3();
         } else {
@@ -70,6 +67,16 @@ pub fn render(
                 Transform::from_translation(pos.extend(0).as_vec3()),
                 template.0.clone(),
             ));
+        }
+    };
+    for pos in world.iter_set_positions() {
+        quad(pos)
+    }
+    for (grid, bijection) in obj.iter() {
+        for cell in grid.iter_set_positions() {
+            if let Some(dst) = bijection.0.src_to_dst(cell.as_uvec2()) {
+                quad(dst)
+            }
         }
     }
 
