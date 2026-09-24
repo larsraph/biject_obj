@@ -232,15 +232,29 @@ impl Grid {
 
         Collider::voxels(Vec3::ONE, &voxels)
     }
+
+    pub fn mass(&self) -> f32 {
+        self.iter_set_positions().count() as f32
+    }
 }
 
 #[derive(Component)]
 pub struct Bijection(pub Solution);
 
 pub fn recalculate_bijection(
-    mut query: Query<(&GlobalTransform, &Grid, &mut Bijection), With<ObjGrid>>,
+    mut query: Query<
+        (
+            &GlobalTransform,
+            &Grid,
+            &mut Bijection,
+            &MaxLinearSpeed,
+            &LinearVelocity,
+        ),
+        (With<ObjGrid>),
+    >,
 ) {
-    for (transform, grid, mut bijection) in query.iter_mut() {
+    for (transform, grid, mut bijection, max, vel) in query.iter_mut() {
+        assert!(vel.length() <= max.0);
         bijection.0 = solve(
             grid.shape.clone(),
             transform.rotation(),

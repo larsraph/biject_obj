@@ -3,6 +3,15 @@ use ndshape::{RuntimeShape, Shape as _};
 use sparse_linear_assignment::{AuctionSolver as _, KhoslaSolver};
 
 pub fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3A) -> Solution {
+    if translation
+        .floor()
+        .abs()
+        .cmpgt(Vec3A::splat(i32::MAX as f32))
+        .any()
+    {
+        // This is being called often.
+        panic!("wooop")
+    }
     let [x, y] = src_shape.as_array();
 
     let mut min = IVec2::MAX;
@@ -32,7 +41,9 @@ pub fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3A
 
     let (mut solver, mut solution) =
         KhoslaSolver::<u32>::new(row_capacity, column_capacity, arcs_capacity);
-    solver.init(num_rows, num_cols).unwrap();
+    solver
+        .init(num_rows, num_cols)
+        .expect(&format!("pos: {:?}, rot: {:?}", translation, rotation));
 
     for (idx, pos) in iter_tuple_idx_pos(&src_shape) {
         let point = pos.as_vec2();

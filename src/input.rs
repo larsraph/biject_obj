@@ -1,4 +1,7 @@
-use avian3d::dynamics::rigid_body::{AngularVelocity, LinearVelocity, LockedAxes, RigidBody};
+use avian3d::dynamics::rigid_body::{
+    AngularVelocity, LinearVelocity, LockedAxes, MaxLinearSpeed, RigidBody,
+    mass_properties::components::Mass,
+};
 use bevy::prelude::*;
 
 use crate::{
@@ -72,6 +75,7 @@ pub fn edit(
                     let objgrid = world.extract(start, cell);
                     if let Some(objgrid) = objgrid {
                         let collider = objgrid.collider();
+                        let mass = objgrid.mass();
 
                         let translation = start.min(cell).extend(0).as_vec3();
                         let solution =
@@ -87,6 +91,7 @@ pub fn edit(
                             objgrid,
                             collider,
                             RigidBody::Dynamic,
+                            MaxLinearSpeed(100.),
                             LockedAxes::new()
                                 .lock_translation_z()
                                 .lock_rotation_x()
@@ -95,6 +100,7 @@ pub fn edit(
                             AngularVelocity(ang),
                             Transform::from_translation(translation),
                             Bijection(solution),
+                            Mass(mass),
                         ));
                     }
                 }
