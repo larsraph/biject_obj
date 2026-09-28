@@ -1,6 +1,6 @@
 use avian3d::prelude::*;
 use bevy::prelude::*;
-use bitvec::{bitbox, boxed::BitBox};
+use bitvec::{bitbox, boxed::BitBox, ptr::BitRef};
 use ndshape::{ConstPow2Shape2u32, RuntimeShape, Shape};
 use std::ops::{Index, IndexMut};
 
@@ -27,7 +27,7 @@ pub type ConstGrid = Grid<ConstPow2Shape2u32<SIZE_LOG2, SIZE_LOG2>>;
 pub type DynGrid = Grid<RuntimeShape<u32, 2>>;
 
 #[derive(Component)]
-pub struct Grid<S: Shape<2, Coord = u32>> {
+pub struct Grid<S> {
     pub ty: Box<[GCell]>,
     pub connection: BitBox,
     pub shape: S,
@@ -52,6 +52,10 @@ impl<S: Shape<2, Coord = u32>> Grid<S> {
             .then_some(self.shape.linearize(pos) as usize)
     }
 
+    pub fn linearize_conn(&self, pos: UVec2, y: bool) -> Option<usize> {
+        self.linearize(pos).map(|idx| (idx << 1) | (y as usize))
+    }
+
     pub fn get(&self, pos: UVec2) -> Option<&GCell> {
         let index = self.linearize(pos)?;
         // SAFETY: index is checked to be within bounds by linearize
@@ -62,6 +66,16 @@ impl<S: Shape<2, Coord = u32>> Grid<S> {
         let index = self.linearize(pos)?;
         // SAFETY: index is checked to be within bounds by linearize
         Some(unsafe { self.ty.get_unchecked_mut(index) })
+    }
+
+    pub fn is_connected(&self, pos: UVec2, y: bool) -> Option<bool> {
+        let index = self.linearize_conn(pos, y)?;
+        // SAFETY: index is checked to be within bounds by linearize
+        Some(unsafe { *self.connection.get_unchecked(index) })
+    }
+
+    pub fn set_connection(&mut self, index: usize, connected: bool) {
+        self.connection.set(index, connected);
     }
 
     pub fn iter_set_positions(&self) -> impl Iterator<Item = IVec2> + '_ {
