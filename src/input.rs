@@ -1,11 +1,10 @@
 use avian3d::dynamics::rigid_body::{
-    AngularVelocity, LinearVelocity, LockedAxes, MaxLinearSpeed, RigidBody,
-    mass_properties::components::Mass,
+    LockedAxes, MaxAngularSpeed, MaxLinearSpeed, RigidBody, mass_properties::components::Mass,
 };
 use bevy::prelude::*;
 
 use crate::{
-    grid::{Bijection, GCell, ObjGrid, WorldGrid},
+    grid::{Bijection, ConstGrid, GCell, ObjGrid, WorldGrid},
     projection::solve,
 };
 
@@ -31,7 +30,7 @@ pub fn edit(
     mut commands: Commands,
     window: Single<&Window>,
     camera: Single<(&Camera, &GlobalTransform)>,
-    mut world: Single<&mut WorldGrid>,
+    mut world: Single<&mut ConstGrid, With<WorldGrid>>,
     mbi: Res<ButtonInput<MouseButton>>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut brush: ResMut<Brush>,
@@ -64,44 +63,45 @@ pub fn edit(
 
         if selecting || selection_ended {
             *last = None;
-            let cell = pos.round().as_ivec2();
+            let current = pos.round().as_ivec2();
 
             if selecting {
-                let (_, end) = selection.0.get_or_insert((cell, cell));
-                *end = cell;
+                let (_, end) = selection.0.get_or_insert((current, current));
+                *end = current;
             }
             if selection_ended {
                 if let Some((start, _)) = selection.0.take() {
-                    let objgrid = world.extract(start, cell);
-                    if let Some(objgrid) = objgrid {
-                        let collider = objgrid.collider();
-                        let mass = objgrid.mass();
+                    if let Ok(p0) = start.try_into()
+                        && let Ok(p1) = current.try_into()
+                    {
+                        let rect = URect::from_corners(p0, p1);
+                        let objgrid = world.extract_rect(rect);
+                        if let Some(objgrid) = objgrid {
+                            let mass = objgrid.mass();
+                            let Some(collider) = objgrid.collider() else {
+                                return Ok(());
+                            };
 
-                        let translation = start.min(cell).extend(0).as_vec3();
-                        let solution =
-                            solve(objgrid.shape.clone(), Quat::default(), translation.into());
+                            let translation = start.min(current).extend(0).as_vec3();
+                            let solution =
+                                solve(objgrid.shape.clone(), Quat::default(), translation.into());
 
-                        let lin: Vec2 = rand::random();
-                        let ang: f32 = rand::random();
-                        let lin = (lin % 8.).extend(0.);
-                        let ang = Vec3::new(0., 0., ang % 8.);
-
-                        commands.spawn((
-                            ObjGrid,
-                            objgrid,
-                            collider,
-                            RigidBody::Dynamic,
-                            MaxLinearSpeed(100.),
-                            LockedAxes::new()
-                                .lock_translation_z()
-                                .lock_rotation_x()
-                                .lock_rotation_y(),
-                            LinearVelocity(lin),
-                            AngularVelocity(ang),
-                            Transform::from_translation(translation),
-                            Bijection(solution),
-                            Mass(mass),
-                        ));
+                            commands.spawn((
+                                ObjGrid,
+                                objgrid,
+                                collider,
+                                RigidBody::Dynamic,
+                                MaxLinearSpeed(100.),
+                                LockedAxes::new()
+                                    .lock_translation_z()
+                                    .lock_rotation_x()
+                                    .lock_rotation_y(),
+                                MaxAngularSpeed(20.0),
+                                Transform::from_translation(translation),
+                                Bijection(solution),
+                                Mass(mass),
+                            ));
+                        }
                     }
                 }
             }

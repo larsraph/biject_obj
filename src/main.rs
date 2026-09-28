@@ -7,7 +7,7 @@ mod projection;
 mod render;
 
 use crate::{
-    grid::{recalculate_bijection, spawn_world_grid, update_world_grid_collider},
+    grid::{WorldGrid, recalculate_bijection, spawn_world_grid, update_colliders},
     input::{Brush, Selection, draw_selection, edit},
     render::{QuadTemplate, render_setup, render_world},
 };
@@ -27,7 +27,7 @@ fn main() {
             (
                 recalculate_bijection,
                 edit,
-                update_world_grid_collider,
+                update_colliders,
                 render_world,
                 draw_selection,
             )
@@ -35,3 +35,5 @@ fn main() {
         )
         .run();
 }
+
+fn solve(_grid: &WorldGrid) {}

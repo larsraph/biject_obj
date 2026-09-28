@@ -1,6 +1,6 @@
 use bevy::{camera::ScalingMode, prelude::*};
 
-use crate::grid::{Bijection, Grid, ObjGrid, SIZE, WorldGrid};
+use crate::grid::{Bijection, ConstGrid, DynGrid, ObjGrid, SIZE, WorldGrid};
 
 const PX_PER_CELL: u32 = 4;
 
@@ -53,8 +53,8 @@ pub fn render_setup(mut commands: Commands) {
 pub fn render_world(
     mut commands: Commands,
     mut quads: Query<(Entity, &mut Transform), With<Quad>>,
-    world: Single<&WorldGrid>,
-    obj: Query<(&Grid, &Bijection), With<ObjGrid>>,
+    world: Single<&ConstGrid, With<WorldGrid>>,
+    obj: Query<(&DynGrid, &Bijection), With<ObjGrid>>,
     template: Res<QuadTemplate>,
 ) {
     let mut recycle = quads.iter_mut();
