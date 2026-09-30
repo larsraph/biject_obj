@@ -1,6 +1,9 @@
 use avian3d::{
-    PhysicsPlugins, collision::collider::Collider,
-    dynamics::rigid_body::mass_properties::bevy_heavy::ComputeMassProperties3d,
+    PhysicsPlugins,
+    collision::collider::Collider,
+    dynamics::rigid_body::{
+        AngularVelocity, LinearVelocity, mass_properties::bevy_heavy::ComputeMassProperties3d,
+    },
 };
 use bevy::{math::CompassQuadrant, prelude::*};
 use bitvec::vec::BitVec;
@@ -11,7 +14,10 @@ mod projection;
 mod render;
 
 use crate::{
-    grid::{GCell, Grid, WorldGrid, recalculate_bijection, spawn_world_grid, update_colliders},
+    grid::{
+        GCell, Grid, recalculate_bijection, spawn_world_grid, update_colliders,
+        world_grid_collision_start,
+    },
     input::{Brush, Selection, draw_selection, edit},
     render::{QuadTemplate, render_setup, render_world},
 };
@@ -29,6 +35,7 @@ fn main() {
         .add_systems(
             Update,
             (
+                world_grid_collision_start,
                 recalculate_bijection,
                 edit,
                 update_colliders,
@@ -44,6 +51,7 @@ use ndshape::Shape;
 
 const MAX_TRANSFER: f32 = 20.;
 
+#[derive(Default)]
 struct Scratch {
     // each cell stores it's velocity
     cell: Vec<Vec2>,
@@ -66,7 +74,7 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
     impulse: Vec2,
     pos: Vec2,
     n: usize,
-) {
+) -> impl Iterator<Item = (Grid<S>, Collider, LinearVelocity, AngularVelocity)> {
     // initalize the scratch
     scratch.cell.clear();
     scratch.face.clear();
@@ -281,24 +289,46 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
     }
 
     // accumulate rotation and linear velocity from cellular velocity for each blob
-    for (cells, blob_grid) in blobs {
+    blobs.into_iter().map(|(cells, blob_grid)| {
+        // AI helped out here
         let collider = Collider::voxels(Vec3::ONE, &cells);
-        let cm = collider.center_of_mass();
-        let mut angular_velocity = Vec3::ZERO;
-        let mut linear_velocity = Vec3::ZERO;
+        let mass_properties = collider.mass_properties(1.0);
+        let cell_mass = mass_properties.mass / cells.len() as f32;
+        let center_of_mass = mass_properties.center_of_mass;
+        let mut angular_momentum = Vec3::ZERO;
+        let mut linear_momentum = Vec3::ZERO;
         let [x, y] = blob_grid.shape.as_array();
         for y in 0..y {
             for x in 0..x {
                 let pos = UVec2::new(x, y);
                 if *blob_grid.get(pos).unwrap() == GCell::Set {
                     let idx = blob_grid.linearize(pos).unwrap();
-                    let velocity_of_cell = scratch.cell[idx];
-                    let cell_pos = pos.as_vec2() + Vec2::splat(0.5);
-                    
+                    let velocity = scratch.cell[idx].extend(0.0);
+                    // `Collider::voxels` interprets an integer coordinate as the
+                    // voxel's lower corner, so use its center for the moment arm.
+                    let cell_center = (pos.as_vec2() + Vec2::splat(0.5)).extend(0.0);
+                    let cell_momentum = cell_mass * velocity;
+
+                    linear_momentum += cell_momentum;
+                    angular_momentum += (cell_center - center_of_mass).cross(cell_momentum);
                 }
             }
         }
-    }
+
+        let linear_velocity = linear_momentum / mass_properties.mass;
+        // All voxels lie in the XY plane, so only rotation about Z is relevant.
+        let angular_velocity =
+            Vec3::Z * (angular_momentum.z / mass_properties.principal_angular_inertia.z);
+
+        // Spawn `blob_grid` with `collider`, `LinearVelocity(linear_velocity)`,
+        // and `AngularVelocity(angular_velocity)` here.
+        (
+            blob_grid,
+            collider,
+            LinearVelocity(linear_velocity),
+            AngularVelocity(angular_velocity),
+        )
+    })
 }
 
 // find c_max such that ||a + cb|| <= d

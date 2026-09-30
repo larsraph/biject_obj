@@ -1,13 +1,11 @@
 use avian3d::prelude::*;
 use bevy::{math::CompassQuadrant, prelude::*};
-use bitvec::{bitbox, boxed::BitBox, ptr::BitRef};
+use bitvec::{bitbox, boxed::BitBox};
 use ndshape::{ConstPow2Shape2u32, RuntimeShape, Shape};
 use std::ops::{Index, IndexMut};
 
-use crate::{
-    ALL,
-    projection::{Solution, solve},
-};
+use crate::ALL;
+use crate::projection::{Solution, solve};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GCell {
@@ -203,22 +201,32 @@ impl<S: Shape<2, Coord = u32>> IndexMut<UVec2> for Grid<S> {
 
 pub fn spawn_world_grid(mut commands: Commands) {
     let grid = ConstGrid::new(SHAPE);
-    commands
-        .spawn((grid, RigidBody::Static, WorldGrid))
-        .observe(world_grid_collision_start);
+    commands.spawn((grid, RigidBody::Static, WorldGrid));
 }
 
-fn world_grid_collision_start(
-    event: On<CollisionStart>,
-    _grids: Query<&mut WorldGrid>,
+pub fn world_grid_collision_start(
+    mut commands: Commands,
+    mut events: MessageReader<CollisionStart>,
+    mut grid: Single<&mut ConstGrid, With<WorldGrid>>,
     collisions: Collisions,
+    mut scratch: Local<super::Scratch>,
 ) {
-    let contact_pair = collisions.get(event.collider1, event.collider2).unwrap();
-    for manifold in &contact_pair.manifolds {
-        for point in &manifold.points {
-            point.normal_impulse;
-            point.point;
-            manifold.normal;
+    for event in events.read() {
+        info!("{:?}", event);
+        let contact_pair = collisions.get(event.collider1, event.collider2).unwrap();
+        for manifold in &contact_pair.manifolds {
+            for point in &manifold.points {
+                let result = super::solve(
+                    &mut *grid,
+                    &mut *scratch,
+                    (point.normal_impulse * manifold.normal).truncate(),
+                    point.point.truncate(),
+                    20,
+                );
+                for (grid, collider, lin, ang) in result {
+                    commands.spawn((grid, collider, lin, ang));
+                }
+            }
         }
     }
 }
