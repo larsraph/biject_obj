@@ -1,5 +1,9 @@
-use avian3d::PhysicsPlugins;
-use bevy::prelude::*;
+use avian3d::{
+    PhysicsPlugins, collision::collider::Collider,
+    dynamics::rigid_body::mass_properties::bevy_heavy::ComputeMassProperties3d,
+};
+use bevy::{math::CompassQuadrant, prelude::*};
+use bitvec::vec::BitVec;
 
 mod grid;
 mod input;
@@ -45,9 +49,18 @@ struct Scratch {
     cell: Vec<Vec2>,
     // each cell stores how much velocity has been transferred between each of it's faces
     face: Vec<[Vec2; 2]>,
+    visited: BitVec,
 }
 
-fn solve<S: Shape<2, Coord = u32>>(
+pub const ALL: [CompassQuadrant; 4] = [
+    CompassQuadrant::North,
+    CompassQuadrant::East,
+    CompassQuadrant::South,
+    CompassQuadrant::West,
+];
+
+// TODO; on edit re-extract surrounding rigid blobs
+fn solve<S: Shape<2, Coord = u32> + Clone>(
     grid: &mut Grid<S>,
     scratch: &mut Scratch,
     impulse: Vec2,
@@ -57,8 +70,10 @@ fn solve<S: Shape<2, Coord = u32>>(
     // initalize the scratch
     scratch.cell.clear();
     scratch.face.clear();
+    scratch.visited.clear();
     scratch.cell.resize(grid.shape.usize(), Vec2::ZERO);
     scratch.face.resize(grid.shape.usize(), [Vec2::ZERO; 2]);
+    scratch.visited.resize(grid.shape.usize(), false);
 
     // add impulse
     let pos = pos.as_ivec2().as_uvec2();
@@ -107,14 +122,62 @@ fn solve<S: Shape<2, Coord = u32>>(
                     // therefore velocity transfer is based on the dot product where if the doc product is negative
                     // it's zero.
 
+                    // example case I want to support
+                    //
+                    // a a a a
+                    // a a a a
+                    // _ a a a
+                    // _ _ b b
+                    //
+                    // where cells in a are inter-connected and cells in b are inter-connected and connected to the boundary.
+                    //
+                    // What I would want to happen is for the constraint between a and b to be non-sticky AND
+                    // for the a cells to be pulled up-left under gravity. However with our current system the b cells
+                    // would just absorb all of the velocity of their a cells and zero them out because the b cells are connected
+                    // to the boundary.
+                    //
+                    // thats because my current system tries to equalize velocity, which it is equalized across the entier a block.
+                    // the key is that the interaction between a and b should be non-sticky AKA it needs to do something else.
+                    // I'm just having trouble figuring out what it should do such that when we solve this we get the a blob
+                    // as having a CCW rotation.
+                    //
+                    // Additionally thats in contrast to the system as such:
+                    //
+                    // a a a a
+                    // a a a a
+                    // a a a a
+                    // b b b b
+                    //
+                    // where cells in a are inter-connected and cells in b are inter-connected and connected to the boundary.
+                    //
+                    // In this case I would expect for the a blob to end up with no conglomerate velocity. In order
+                    // to end up with no conglomerate velocity then ideally there would be some translation between the a and b cells.
+                    //
+                    // Also to clarify this is under gravity so all the cells have a equal downward velocity.
+                    //
+                    //
+                    // To summarize the above conflict:
+                    // I wanted to support completely rigid simulation via sticky/rigid collisions
+                    // at the same time I wanted to support rigid body simulation insdie the grid
+                    // because I thought I had to always simiulate rigid body gravity in order for it
+                    // to be correct. However the obvious answer is NOT to simulate gravity in the grid
+                    // rather extract rigid blobs, run gravity, and then once they stop moving reproject
+                    // them onto the grid... after this point we know gravity has no effect. The danger case
+                    // is if cells are removed. We can probably handily simulate that by, on removal, re-extracting
+                    // any rigid blobs directly adjacent to the cell, simulating them again. Then reprojecting
+                    // once they stop moving.
+                    //
+                    // Another comment. Gravity cannot tear blobs apart because it's only simulated on entire
+                    // rigid blobs at a time.
+
                     let dot = vel_a.dot(vel_b);
                     if dot > 0. {
-                        // completely rigid collision
+                        // completely sticky/rigid collision
                         let half_diff = (vel_a - vel_b) / 2.;
                         scratch.cell[a_idx] -= half_diff;
                         scratch.cell[b_idx] += half_diff;
                         scratch.face[a_idx][is_y as usize] += half_diff;
-                    } else if grid.is_connected(pos, is_y).unwrap() {
+                    } else if grid.is_connected_raw(pos, is_y).unwrap() {
                         // cohesion
                         let transferred = &mut scratch.face[a_idx][is_y as usize];
 
@@ -138,17 +201,104 @@ fn solve<S: Shape<2, Coord = u32>>(
     //
     // for now we're just taking all that transfered more than MAX_TRANSFER
     // and breaking the bonds... however it may make more sense to have collision
-    // based velocity transfer not break bonds.
+    // based velocity transfer not break bonds?
     for (idx, [x, y]) in scratch.face.iter().enumerate() {
         if x.length() >= MAX_TRANSFER - 1e-6 {
-            grid.set_connection(idx * 2, false);
+            grid.connection.set(idx * 2, false);
         }
         if y.length() >= MAX_TRANSFER - 1e-6 {
-            grid.set_connection(idx * 2 + 1, false);
+            grid.connection.set(idx * 2 + 1, false);
         }
     }
 
-    // detect all blocks of cells NOT connected to the boundary that have non-zero velocity.
+    // detect all blobs of cells NOT connected to the boundary that have non-zero velocity.
+    //
+    // okay but theres a slight problem here. What about cells that aren't connected to the boundary? but are sitting still and
+    // are stirred into motion by gravity? Well in the end what's happening is that the boundary cells work as velocity sinks and
+    // then the simulation can use the constraints again and again to zero out the velocity of all cells... in other words that doesn't
+    // make any fucking sense. The situation that arises that we must handle is a non-connected balanced blob that becomes unbalanced.
+    // In order to test this we cannot act like the unconnected blob is rigidly connected to it's neighbors (which is what the above assumes)
+    // which we used to elide large-scale rotation of a rigid body. I want to avoid large-scale rotation of a (cellular) rigid body in general but I
+    // still need to somehow detect when it starts so I can extract it from the main_grid.
+    let mut blobs = Vec::new();
+    let [y_size, x_size] = grid.shape.as_array();
+    for y in 0..y_size {
+        for x in 0..x_size {
+            let pos = UVec2::new(x, y);
+            let idx = grid.shape.linearize(pos) as usize;
+            if !scratch.visited[idx] {
+                if scratch.cell[idx].abs().cmpge(Vec2::splat(1e-5)).any() {
+                    fn flood<S: Shape<2, Coord = u32>>(
+                        cell: UVec2,
+                        from: CompassQuadrant,
+                        grid: &mut Grid<S>,
+                        scratch: &mut Scratch,
+                        blob_vec: &mut Vec<IVec3>,
+                        blob_grid: &mut Grid<S>,
+                    ) {
+                        for to in ALL {
+                            if to == from.opposite() {
+                                continue;
+                            }
+                            let offset = match to {
+                                CompassQuadrant::East => IVec2::new(1, 0),
+                                CompassQuadrant::South => IVec2::new(0, 1),
+                                CompassQuadrant::West => IVec2::new(-1, 0),
+                                CompassQuadrant::North => IVec2::new(0, -1),
+                            };
+                            if let Some(target) = cell.checked_add_signed(offset)
+                                && let Some(index) = grid.linearize(target)
+                                && !scratch.visited[index as usize]
+                                && grid.ty[index] == GCell::Set
+                                && grid.is_connected(cell, to).unwrap()
+                            {
+                                blob_grid.take_from(grid, target);
+                                blob_grid.set_connection(cell, to, true);
+                                grid.set_connection(cell, to, false);
+                                scratch.visited.set(index as usize, true);
+                                blob_vec.push(target.as_ivec2().extend(0));
+                                flood(target, to, grid, scratch, blob_vec, blob_grid)
+                            }
+                        }
+                    }
+                    let mut blob_grid = Grid::new(grid.shape.clone());
+                    let mut blob_vec = Vec::new();
+                    scratch.visited.set(idx, true);
+                    blob_vec.push(pos.as_ivec2().extend(0));
+                    blob_grid.take_from(grid, pos);
+                    flood(
+                        UVec2::new(x, y),
+                        CompassQuadrant::East,
+                        grid,
+                        scratch,
+                        &mut blob_vec,
+                        &mut blob_grid,
+                    );
+                    blobs.push((blob_vec, blob_grid));
+                }
+            }
+        }
+    }
+
+    // accumulate rotation and linear velocity from cellular velocity for each blob
+    for (cells, blob_grid) in blobs {
+        let collider = Collider::voxels(Vec3::ONE, &cells);
+        let cm = collider.center_of_mass();
+        let mut angular_velocity = Vec3::ZERO;
+        let mut linear_velocity = Vec3::ZERO;
+        let [x, y] = blob_grid.shape.as_array();
+        for y in 0..y {
+            for x in 0..x {
+                let pos = UVec2::new(x, y);
+                if *blob_grid.get(pos).unwrap() == GCell::Set {
+                    let idx = blob_grid.linearize(pos).unwrap();
+                    let velocity_of_cell = scratch.cell[idx];
+                    let cell_pos = pos.as_vec2() + Vec2::splat(0.5);
+                    
+                }
+            }
+        }
+    }
 }
 
 // find c_max such that ||a + cb|| <= d

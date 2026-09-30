@@ -1,10 +1,13 @@
 use avian3d::prelude::*;
-use bevy::prelude::*;
+use bevy::{math::CompassQuadrant, prelude::*};
 use bitvec::{bitbox, boxed::BitBox, ptr::BitRef};
 use ndshape::{ConstPow2Shape2u32, RuntimeShape, Shape};
 use std::ops::{Index, IndexMut};
 
-use crate::projection::{Solution, solve};
+use crate::{
+    ALL,
+    projection::{Solution, solve},
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GCell {
@@ -42,6 +45,12 @@ impl<S: Shape<2, Coord = u32>> Grid<S> {
         }
     }
 
+    pub fn take_from(&mut self, other: &mut Self, pos: UVec2) {
+        let index = self.linearize(pos).unwrap();
+        self.ty[index] = other.ty[index];
+        other.ty[index] = GCell::Unset;
+    }
+
     pub fn contains(&self, pos: UVec2) -> bool {
         let bound = UVec2::from(self.shape.as_array());
         pos.cmplt(bound).all()
@@ -68,13 +77,29 @@ impl<S: Shape<2, Coord = u32>> Grid<S> {
         Some(unsafe { self.ty.get_unchecked_mut(index) })
     }
 
-    pub fn is_connected(&self, pos: UVec2, y: bool) -> Option<bool> {
+    pub fn is_connected_raw(&self, pos: UVec2, y: bool) -> Option<bool> {
         let index = self.linearize_conn(pos, y)?;
         // SAFETY: index is checked to be within bounds by linearize
         Some(unsafe { *self.connection.get_unchecked(index) })
     }
 
-    pub fn set_connection(&mut self, index: usize, connected: bool) {
+    pub fn is_connected(&self, pos: UVec2, quad: CompassQuadrant) -> Option<bool> {
+        match quad {
+            CompassQuadrant::North => self.is_connected_raw(pos, true),
+            CompassQuadrant::South => self.is_connected_raw(pos - UVec2::new(0, 1), true),
+            CompassQuadrant::East => self.is_connected_raw(pos - UVec2::new(1, 0), false),
+            CompassQuadrant::West => self.is_connected_raw(pos, false),
+        }
+    }
+
+    pub fn set_connection(&mut self, pos: UVec2, quad: CompassQuadrant, connected: bool) {
+        let (offset, is_y) = match quad {
+            CompassQuadrant::North => (UVec2::new(0, 0), true),
+            CompassQuadrant::South => (UVec2::new(0, 1), true),
+            CompassQuadrant::East => (UVec2::new(1, 0), false),
+            CompassQuadrant::West => (UVec2::new(0, 0), false),
+        };
+        let index = self.linearize_conn(pos + offset, is_y).unwrap();
         self.connection.set(index, connected);
     }
 
