@@ -4,6 +4,7 @@ use avian3d::{
     dynamics::rigid_body::{
         AngularVelocity, LinearVelocity, mass_properties::bevy_heavy::ComputeMassProperties3d,
     },
+    schedule::{PhysicsSchedule, PhysicsStepSystems},
 };
 use bevy::{math::CompassQuadrant, prelude::*};
 use bitvec::vec::BitVec;
@@ -15,15 +16,19 @@ mod render;
 
 use crate::{
     grid::{
-        GCell, Grid, recalculate_bijection, spawn_world_grid, update_colliders,
-        world_grid_collision_start,
+        Const, Dyn, DynGrid, GCell, Grid, SIZE, recalculate_bijection, spawn_world_grid,
+        update_colliders, world_grid_collision_start,
     },
-    input::{Brush, Selection, draw_selection, edit},
+    input::{
+        Brush, MouseTarget, Selection, draw_selection, edit, move_mouse_rigid_body,
+        update_mouse_rigid_body,
+    },
     render::{QuadTemplate, render_setup, render_world},
 };
 
 fn main() {
     App::new()
+        .insert_resource(ClearColor(Color::srgb(0.55, 0.65, 0.8)))
         .add_plugins((
             DefaultPlugins.set(render::square_window()),
             PhysicsPlugins::default(),
@@ -31,11 +36,18 @@ fn main() {
         .init_resource::<QuadTemplate>()
         .init_resource::<Brush>()
         .init_resource::<Selection>()
+        .init_resource::<MouseTarget>()
         .add_systems(Startup, (spawn_world_grid, render_setup))
+        .add_systems(Update, update_mouse_rigid_body)
+        .add_systems(
+            PhysicsSchedule,
+            move_mouse_rigid_body.before(PhysicsStepSystems::First),
+        )
         .add_systems(
             Update,
             (
-                world_grid_collision_start,
+                world_grid_collision_start::<Const>,
+                world_grid_collision_start::<Dyn>,
                 recalculate_bijection,
                 edit,
                 update_colliders,
@@ -67,27 +79,32 @@ pub const ALL: [CompassQuadrant; 4] = [
     CompassQuadrant::West,
 ];
 
-// TODO; on edit re-extract surrounding rigid blobs
-fn solve<S: Shape<2, Coord = u32> + Clone>(
-    grid: &mut Grid<S>,
-    scratch: &mut Scratch,
-    impulse: Vec2,
-    pos: Vec2,
-    n: usize,
-) -> impl Iterator<Item = (Grid<S>, Collider, LinearVelocity, AngularVelocity)> {
-    // initalize the scratch
+fn initalize_scratch<S: Shape<2, Coord = u32> + Clone>(grid: &Grid<S>, scratch: &mut Scratch) {
     scratch.cell.clear();
     scratch.face.clear();
     scratch.visited.clear();
     scratch.cell.resize(grid.shape.usize(), Vec2::ZERO);
     scratch.face.resize(grid.shape.usize(), [Vec2::ZERO; 2]);
     scratch.visited.resize(grid.shape.usize(), false);
+}
 
-    // add impulse
+fn add_impulse<S: Shape<2, Coord = u32> + Clone>(
+    grid: &Grid<S>,
+    scratch: &mut Scratch,
+    impulse: Vec2,
+    pos: Vec2,
+) {
     let pos = pos.as_ivec2().as_uvec2();
     let idx = grid.linearize(pos).unwrap();
     scratch.cell[idx] = impulse;
+}
 
+// TODO; on edit re-extract surrounding rigid blobs
+fn solve<S: Shape<2, Coord = u32> + Clone>(
+    grid: &mut Grid<S>,
+    scratch: &mut Scratch,
+    n: usize,
+) -> impl Iterator<Item = (DynGrid, Collider, LinearVelocity, AngularVelocity)> {
     // iterativly solve
     for _ in 0..n {
         // for every constraint try to equalize the velocities
@@ -95,7 +112,7 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
         for y in 0..y_range {
             for x in 0..x_range {
                 let pos = UVec2::new(x, y);
-                if matches!(grid[pos], GCell::Unset) {
+                if grid[pos] == GCell::Unset {
                     continue;
                 }
                 for is_y in [true, false] {
@@ -108,7 +125,7 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
                     let a = pos;
                     let b = pos.wrapping_add_signed(step);
 
-                    if matches!(grid[b], GCell::Unset) {
+                    if grid[b] == GCell::Unset {
                         continue;
                     }
 
@@ -186,7 +203,7 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
                         scratch.cell[b_idx] += half_diff;
                         scratch.face[a_idx][is_y as usize] += half_diff;
                     } else if grid.is_connected_raw(pos, is_y).unwrap() {
-                        // cohesion
+                        // pulled apart has a cap and requires connection
                         let transferred = &mut scratch.face[a_idx][is_y as usize];
 
                         let half_diff = (vel_a - vel_b) / 2.;
@@ -219,6 +236,10 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
         }
     }
 
+    fn is_boundary(pos: UVec2) -> bool {
+        pos.cmpeq(UVec2::ZERO).any() || pos.cmpeq(UVec2::splat(SIZE - 1)).any()
+    }
+
     // detect all blobs of cells NOT connected to the boundary that have non-zero velocity.
     //
     // okay but theres a slight problem here. What about cells that aren't connected to the boundary? but are sitting still and
@@ -230,23 +251,25 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
     // still need to somehow detect when it starts so I can extract it from the main_grid.
     let mut blobs = Vec::new();
     let [y_size, x_size] = grid.shape.as_array();
-    for y in 0..y_size {
-        for x in 0..x_size {
+    for y in 1..y_size - 1 {
+        for x in 1..x_size - 1 {
             let pos = UVec2::new(x, y);
             let idx = grid.shape.linearize(pos) as usize;
             if !scratch.visited[idx] {
                 if scratch.cell[idx].abs().cmpge(Vec2::splat(1e-5)).any() {
                     fn flood<S: Shape<2, Coord = u32>>(
                         cell: UVec2,
-                        from: CompassQuadrant,
+                        from: Option<CompassQuadrant>,
                         grid: &mut Grid<S>,
                         scratch: &mut Scratch,
                         blob_vec: &mut Vec<IVec3>,
-                        blob_grid: &mut Grid<S>,
-                    ) {
+                        blob_grid: &mut DynGrid,
+                    ) -> bool {
                         for to in ALL {
-                            if to == from.opposite() {
-                                continue;
+                            if let Some(from) = from {
+                                if to == from.opposite() {
+                                    continue;
+                                }
                             }
                             let offset = match to {
                                 CompassQuadrant::East => IVec2::new(1, 0),
@@ -260,29 +283,40 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
                                 && grid.ty[index] == GCell::Set
                                 && grid.is_connected(cell, to).unwrap()
                             {
+                                if is_boundary(target) {
+                                    return false;
+                                }
                                 blob_grid.take_from(grid, target);
                                 blob_grid.set_connection(cell, to, true);
                                 grid.set_connection(cell, to, false);
                                 scratch.visited.set(index as usize, true);
                                 blob_vec.push(target.as_ivec2().extend(0));
-                                flood(target, to, grid, scratch, blob_vec, blob_grid)
+                                let boundary =
+                                    flood(target, Some(to), grid, scratch, blob_vec, blob_grid);
+                                if boundary {
+                                    return true;
+                                }
                             }
                         }
+                        false
                     }
-                    let mut blob_grid = Grid::new(grid.shape.clone());
+                    let mut blob_grid = Grid::new(grid.shape.clone()).to_dyn();
                     let mut blob_vec = Vec::new();
                     scratch.visited.set(idx, true);
                     blob_vec.push(pos.as_ivec2().extend(0));
                     blob_grid.take_from(grid, pos);
-                    flood(
+                    let boundary = flood(
                         UVec2::new(x, y),
-                        CompassQuadrant::East,
+                        // since we iterate from -x
+                        None,
                         grid,
                         scratch,
                         &mut blob_vec,
                         &mut blob_grid,
                     );
-                    blobs.push((blob_vec, blob_grid));
+                    if !boundary {
+                        blobs.push((blob_vec, blob_grid));
+                    }
                 }
             }
         }
@@ -320,8 +354,6 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
         let angular_velocity =
             Vec3::Z * (angular_momentum.z / mass_properties.principal_angular_inertia.z);
 
-        // Spawn `blob_grid` with `collider`, `LinearVelocity(linear_velocity)`,
-        // and `AngularVelocity(angular_velocity)` here.
         (
             blob_grid,
             collider,
