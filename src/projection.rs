@@ -60,7 +60,7 @@ pub fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3A
 
     Solution {
         src_to_dst: solution.person_to_object,
-        dst_to_src: solution.object_to_person,
+        _dst_to_src: solution.object_to_person,
         src_shape,
         dst_shape,
         dst_origin,
@@ -69,7 +69,7 @@ pub fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3A
 
 pub struct Solution {
     pub src_to_dst: Vec<u32>,
-    pub dst_to_src: Vec<u32>,
+    pub _dst_to_src: Vec<u32>,
     src_shape: RuntimeShape<u32, 2>,
     dst_shape: RuntimeShape<u32, 2>,
     dst_origin: IVec2,
@@ -91,13 +91,13 @@ impl Solution {
         Some(pos)
     }
 
-    pub fn dst_to_src(&self, pos: IVec2) -> Option<UVec2> {
+    pub fn _dst_to_src(&self, pos: IVec2) -> Option<UVec2> {
         let local_pos = (pos - self.dst_origin).as_uvec2();
         if !self.dst_shape.contains(local_pos) {
             return None;
         }
         let dst_idx = self.dst_shape.linearize(local_pos) as usize;
-        let src_idx = self.dst_to_src[dst_idx];
+        let src_idx = self._dst_to_src[dst_idx];
         // dst_cells are not guaranteed to map to src_cells
         if src_idx == u32::MAX {
             return None;

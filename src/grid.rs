@@ -14,7 +14,7 @@ pub enum GCell {
 
 pub const SIZE_LOG2: u32 = 8;
 pub const SIZE: u32 = 1 << SIZE_LOG2;
-pub const SIZE_POW2: u32 = SIZE * SIZE;
+pub const _SIZE_POW2: u32 = SIZE * SIZE;
 pub type S = ConstPow2Shape2u32<SIZE_LOG2, SIZE_LOG2>;
 pub const SHAPE: S = S {};
 
@@ -46,7 +46,7 @@ impl<S: Shape<2, Coord = u32>> Grid<S> {
         }
     }
 
-    pub fn take_from<D: Shape<2, Coord = u32>>(&mut self, other: &mut Grid<D>, pos: UVec2) {
+    pub fn _take_from<D: Shape<2, Coord = u32>>(&mut self, other: &mut Grid<D>, pos: UVec2) {
         let index = self.linearize(pos).unwrap();
         self.ty[index] = other.ty[index];
         other.ty[index] = GCell::Unset;

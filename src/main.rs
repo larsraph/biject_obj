@@ -13,8 +13,8 @@ use crate::{
         update_colliders, world_grid_collision_start,
     },
     input::{
-        Brush, MouseTarget, Selection, draw_selection, edit, move_mouse_rigid_body,
-        clamp_velocities, update_mouse_rigid_body,
+        Brush, MouseTarget, Selection, clamp_velocities, draw_selection, edit,
+        move_mouse_rigid_body, update_mouse_rigid_body,
     },
     render::{QuadTemplate, render_setup, render_world},
 };
@@ -34,10 +34,7 @@ fn main() {
         .add_systems(Update, update_mouse_rigid_body)
         .add_systems(
             PostUpdate,
-            (
-                move_mouse_rigid_body,
-                clamp_velocities,
-            )
+            (move_mouse_rigid_body, clamp_velocities)
                 .chain()
                 .before(PhysicsSet::SyncBackend),
         )
