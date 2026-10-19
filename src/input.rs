@@ -1,12 +1,5 @@
-use avian3d::{
-    collision::collider::Collider,
-    dynamics::rigid_body::{
-        GravityScale, LinearVelocity, LockedAxes, MaxAngularSpeed, MaxLinearSpeed, RigidBody,
-        mass_properties::components::Mass,
-    },
-    prelude::{Position, SleepingDisabled},
-};
 use bevy::prelude::*;
+use bevy_rapier3d::prelude::*;
 
 use crate::{
     grid::{Bijection, ConstGrid, GCell, ObjGrid, WorldGrid},
@@ -37,6 +30,14 @@ pub struct MouseTarget(pub Option<Vec3>);
 
 #[derive(Component)]
 pub struct MouseFollower;
+
+/// Rapier has no built-in velocity-limit components, so retain Avian's per-body
+/// caps with an equivalent clamp before each simulation step.
+#[derive(Component)]
+pub struct VelocityCap {
+    linear: f32,
+    angular: f32,
+}
 
 /// Creates the right-click physics body and updates the target it follows.
 pub fn update_mouse_rigid_body(
@@ -74,16 +75,14 @@ pub fn update_mouse_rigid_body(
         commands.spawn((
             MouseFollower,
             RigidBody::Dynamic,
-            Collider::sphere(0.5),
-            Position::from_xyz(position.x, position.y, position.z),
+            Collider::ball(0.5),
             Transform::from_translation(position),
-            LinearVelocity::ZERO,
+            Velocity::zero(),
             GravityScale(0.0),
-            SleepingDisabled,
-            LockedAxes::new()
-                .lock_translation_z()
-                .lock_rotation_x()
-                .lock_rotation_y(),
+            Sleeping::disabled(),
+            LockedAxes::TRANSLATION_LOCKED_Z
+                | LockedAxes::ROTATION_LOCKED_X
+                | LockedAxes::ROTATION_LOCKED_Y,
         ));
     }
 }
@@ -92,7 +91,7 @@ pub fn update_mouse_rigid_body(
 pub fn move_mouse_rigid_body(
     target: Res<MouseTarget>,
     time: Res<Time>,
-    mut followers: Query<(&Position, &mut LinearVelocity), With<MouseFollower>>,
+    mut followers: Query<(&Transform, &mut Velocity), With<MouseFollower>>,
 ) {
     let Some(target) = target.0 else {
         return;
@@ -103,7 +102,14 @@ pub fn move_mouse_rigid_body(
     }
 
     for (position, mut velocity) in &mut followers {
-        velocity.0 = (target - position.0) / delta_seconds;
+        velocity.linear = (target - position.translation) / delta_seconds;
+    }
+}
+
+pub fn clamp_velocities(mut bodies: Query<(&mut Velocity, &VelocityCap)>) {
+    for (mut velocity, cap) in &mut bodies {
+        velocity.linear = velocity.linear.clamp_length_max(cap.linear);
+        velocity.angular = velocity.angular.clamp_length_max(cap.angular);
     }
 }
 
@@ -171,15 +177,16 @@ pub fn edit(
                                 objgrid,
                                 collider,
                                 RigidBody::Dynamic,
-                                MaxLinearSpeed(100.),
-                                LockedAxes::new()
-                                    .lock_translation_z()
-                                    .lock_rotation_x()
-                                    .lock_rotation_y(),
-                                MaxAngularSpeed(20.0),
+                                VelocityCap {
+                                    linear: 100.0,
+                                    angular: 20.0,
+                                },
+                                LockedAxes::TRANSLATION_LOCKED_Z
+                                    | LockedAxes::ROTATION_LOCKED_X
+                                    | LockedAxes::ROTATION_LOCKED_Y,
                                 Transform::from_translation(translation),
                                 Bijection(solution),
-                                Mass(mass),
+                                ColliderMassProperties::Mass(mass),
                             ));
                         }
                     }

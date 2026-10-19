@@ -1,10 +1,9 @@
-use avian3d::prelude::*;
 use bevy::{math::CompassQuadrant, prelude::*};
+use bevy_rapier3d::prelude::*;
 use bitvec::{bitbox, boxed::BitBox};
 use ndshape::{ConstPow2Shape2u32, RuntimeShape, Shape};
 use std::ops::{Index, IndexMut};
 
-use crate::ALL;
 use crate::projection::{Solution, solve};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -343,10 +342,10 @@ pub fn spawn_world_grid(mut commands: Commands) {
     let grid = ConstGrid::new(SHAPE);
     commands.spawn((
         grid,
-        RigidBody::Static,
+        RigidBody::Fixed,
         WorldGrid,
         Anchors,
-        CollisionEventsEnabled,
+        ActiveEvents::COLLISION_EVENTS,
     ));
 
     let size = SIZE as f32;
@@ -360,22 +359,22 @@ pub fn spawn_world_grid(mut commands: Commands) {
     // dynamic voxel objects within the playable area.
     commands.spawn_batch([
         (
-            RigidBody::Static,
+            RigidBody::Fixed,
             Collider::cuboid(BOUNDARY_THICKNESS, outer_length, 1.0),
             Transform::from_xyz(low_edge, center, 0.0),
         ),
         (
-            RigidBody::Static,
+            RigidBody::Fixed,
             Collider::cuboid(BOUNDARY_THICKNESS, outer_length, 1.0),
             Transform::from_xyz(high_edge, center, 0.0),
         ),
         (
-            RigidBody::Static,
+            RigidBody::Fixed,
             Collider::cuboid(outer_length, BOUNDARY_THICKNESS, 1.0),
             Transform::from_xyz(center, low_edge, 0.0),
         ),
         (
-            RigidBody::Static,
+            RigidBody::Fixed,
             Collider::cuboid(outer_length, BOUNDARY_THICKNESS, 1.0),
             Transform::from_xyz(center, high_edge, 0.0),
         ),
@@ -389,16 +388,23 @@ pub fn world_grid_collision_start<
     S: Shape<2, Coord = u32> + Send + Sync + 'static + Clone + std::fmt::Debug,
 >(
     mut commands: Commands,
-    mut events: MessageReader<CollisionStart>,
+    mut events: MessageReader<CollisionEvent>,
     mut grids: Query<(Entity, &mut Grid<S>, &GlobalTransform, Option<&Anchors>)>,
-    collisions: Collisions,
+    rapier_context: ReadRapierContext,
     mut scratch: Local<super::Scratch>,
 ) {
+    let Ok(rapier_context) = rapier_context.single() else {
+        return;
+    };
+
     for event in events.read() {
+        let CollisionEvent::Started(collider1, collider2, _) = *event else {
+            continue;
+        };
         // A collision has one relevant grid, not two. Pick the first participant
         // that carries this concrete `Grid<S>` component; the other can be a
         // mouse collider, a wall, or a grid with another shape type.
-        let Some(grid_entity) = [event.collider1, event.collider2]
+        let Some(grid_entity) = [collider1, collider2]
             .into_iter()
             .find(|&entity| grids.contains(entity))
         else {
@@ -407,26 +413,31 @@ pub fn world_grid_collision_start<
         let Ok((_, mut grid, transform, anchors)) = grids.get_mut(grid_entity) else {
             continue;
         };
-        let Some(contact_pair) = collisions.get(event.collider1, event.collider2) else {
+        let Some(contact_pair) = rapier_context.contact_pair(collider1, collider2) else {
             continue;
         };
         let local_from_world = transform.affine().inverse();
-        let grid_first = contact_pair.collider1 == grid_entity;
-        for manifold in &contact_pair.manifolds {
+        let grid_first = contact_pair.collider1() == Some(grid_entity);
+        for manifold in contact_pair.manifolds() {
             super::initalize_scratch(&grid, &mut scratch);
-            for point in &manifold.points {
+            for point in manifold.points() {
                 let impulse_world =
-                    manifold.normal * point.normal_impulse * if grid_first { -1. } else { 1. };
+                    manifold.normal() * point.impulse() * if grid_first { -1. } else { 1. };
+                let point_world = if grid_first {
+                    transform.transform_point(point.local_p1())
+                } else {
+                    transform.transform_point(point.local_p2())
+                };
                 super::add_impulse(
                     &grid,
                     &mut scratch,
                     local_from_world.transform_vector3(impulse_world).truncate(),
-                    local_from_world.transform_point3(point.point).truncate(),
+                    local_from_world.transform_point3(point_world).truncate(),
                 );
             }
             let result = super::solve(&mut grid, &mut scratch, 10, anchors.is_some());
 
-            for (grid, collider, lin, ang) in result {
+            for (grid, collider, velocity) in result {
                 let solution = super::projection::solve(
                     grid.shape.clone(),
                     Quat::default(),
@@ -435,17 +446,15 @@ pub fn world_grid_collision_start<
                 commands.spawn((
                     grid,
                     collider,
-                    lin,
-                    ang,
+                    velocity,
                     Transform::from_translation(transform.translation()),
                     RigidBody::Dynamic,
                     ObjGrid,
-                    avian3d::prelude::LockedAxes::new()
-                        .lock_translation_z()
-                        .lock_rotation_x()
-                        .lock_rotation_y(),
+                    LockedAxes::TRANSLATION_LOCKED_Z
+                        | LockedAxes::ROTATION_LOCKED_X
+                        | LockedAxes::ROTATION_LOCKED_Y,
                     Bijection(solution),
-                    CollisionEventsEnabled,
+                    ActiveEvents::COLLISION_EVENTS,
                 ));
             }
         }

@@ -1,12 +1,5 @@
-use avian3d::{
-    PhysicsPlugins,
-    collision::collider::Collider,
-    dynamics::rigid_body::{
-        AngularVelocity, LinearVelocity, mass_properties::bevy_heavy::ComputeMassProperties3d,
-    },
-    schedule::{PhysicsSchedule, PhysicsStepSystems},
-};
 use bevy::{math::CompassQuadrant, prelude::*};
+use bevy_rapier3d::prelude::*;
 use bitvec::vec::BitVec;
 
 mod grid;
@@ -21,7 +14,7 @@ use crate::{
     },
     input::{
         Brush, MouseTarget, Selection, draw_selection, edit, move_mouse_rigid_body,
-        update_mouse_rigid_body,
+        clamp_velocities, update_mouse_rigid_body,
     },
     render::{QuadTemplate, render_setup, render_world},
 };
@@ -31,7 +24,7 @@ fn main() {
         .insert_resource(ClearColor(Color::srgb(0.55, 0.65, 0.8)))
         .add_plugins((
             DefaultPlugins.set(render::square_window()),
-            PhysicsPlugins::default(),
+            RapierPhysicsPlugin::<NoUserData>::default(),
         ))
         .init_resource::<QuadTemplate>()
         .init_resource::<Brush>()
@@ -40,11 +33,16 @@ fn main() {
         .add_systems(Startup, (spawn_world_grid, render_setup))
         .add_systems(Update, update_mouse_rigid_body)
         .add_systems(
-            PhysicsSchedule,
-            move_mouse_rigid_body.before(PhysicsStepSystems::First),
+            PostUpdate,
+            (
+                move_mouse_rigid_body,
+                clamp_velocities,
+            )
+                .chain()
+                .before(PhysicsSet::SyncBackend),
         )
         .add_systems(
-            Update,
+            PostUpdate,
             (
                 (
                     world_grid_collision_start::<Const>,
@@ -117,7 +115,7 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
     scratch: &mut Scratch,
     n: usize,
     anchors_boundary: bool,
-) -> impl Iterator<Item = (DynGrid, Collider, LinearVelocity, AngularVelocity)> {
+) -> impl Iterator<Item = (DynGrid, Collider, Velocity)> {
     // iterativly solve
     for _ in 0..n {
         // for every constraint try to equalize the velocities
@@ -356,9 +354,16 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
     blobs.into_iter().map(|(cells, blob_grid)| {
         // AI helped out here
         let collider = Collider::voxels(Vec3::ONE, &cells);
-        let mass_properties = collider.mass_properties(1.0);
-        let cell_mass = mass_properties.mass / cells.len() as f32;
-        let center_of_mass = mass_properties.center_of_mass;
+        // A unit voxel with density one has unit mass. Its center is at its
+        // integer grid coordinate plus (0.5, 0.5, 0.5), which matches Rapier's
+        // voxel convention and the former Avian calculation.
+        let mass = cells.len() as f32;
+        let cell_mass = 1.0;
+        let center_of_mass = cells
+            .iter()
+            .map(|cell| cell.as_vec3() + Vec3::splat(0.5))
+            .sum::<Vec3>()
+            / mass;
         let mut angular_momentum = Vec3::ZERO;
         let mut linear_momentum = Vec3::ZERO;
         let [x, y] = blob_grid.shape.as_array();
@@ -379,17 +384,21 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
             }
         }
 
-        let linear_velocity = linear_momentum / mass_properties.mass;
+        let linear_velocity = linear_momentum / mass;
         // All voxels lie in the XY plane, so only rotation about Z is relevant.
+        let principal_angular_inertia_z = cells.iter().fold(0.0, |inertia, cell| {
+            let center = cell.as_vec3() + Vec3::splat(0.5);
+            // The moment of inertia of a unit-mass unit cube about Z through its
+            // center is 1/6; add the parallel-axis contribution for the blob.
+            inertia + 1.0 / 6.0 + (center - center_of_mass).truncate().length_squared()
+        });
         let angular_velocity =
-            Vec3::Z * (angular_momentum.z / mass_properties.principal_angular_inertia.z);
+            Vec3::Z * (angular_momentum.z / principal_angular_inertia_z);
 
-        (
-            blob_grid,
-            collider,
-            LinearVelocity(linear_velocity),
-            AngularVelocity(angular_velocity),
-        )
+        (blob_grid, collider, Velocity {
+            linear: linear_velocity,
+            angular: angular_velocity,
+        })
     })
 }
 
