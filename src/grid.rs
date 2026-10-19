@@ -31,7 +31,7 @@ pub type DynGrid = Grid<Dyn>;
 
 const BOUNDARY_THICKNESS: f32 = 1.0;
 
-#[derive(Component)]
+#[derive(Component, Debug)]
 pub struct Grid<S> {
     pub ty: Box<[GCell]>,
     pub connection: BitBox,
@@ -220,7 +220,7 @@ impl<S: Shape<2, Coord = u32>> Grid<S> {
         // from the world without damaging its internal connectivity.
         for y in 0..size.y {
             for x in 0..size.x {
-                /// Painting a new cell bonds it to each existing orthogonal neighbor. Erasing a
+                // Painting a new cell bonds it to each existing orthogonal neighbor. Erasing a
                 let lpos = UVec2::new(x, y);
                 let wpos = lpos + rect.min;
                 if grid[lpos] != GCell::Set {
@@ -274,6 +274,55 @@ impl<S: Shape<2, Coord = u32>> Grid<S> {
             connection: self.connection,
         }
     }
+
+    pub fn shrink_to_fit(fles: &mut Option<Self>) {
+        let Some(slef) = fles else {
+            return;
+        };
+        let [x, y] = slef.shape.as_array();
+
+        let mut upper_y = y - 1;
+        'outer: loop {
+            for x in 0..x {
+                let pos = UVec2::new(x, y);
+                if matches!(slef.get(pos), Some(GCell::Set)) {
+                    break 'outer;
+                }
+            }
+            if upper_y == 0 {
+                return *fles = None;
+            }
+            upper_y -= 1
+        }
+
+        let mut lower_y = 0;
+        'outer: loop {
+            for x in 0..x {
+                let pos = UVec2::new(x, y);
+                if matches!(slef.get(pos), Some(GCell::Set)) {
+                    break 'outer;
+                }
+            }
+            if lower_y == y - 1 {
+                return *fles = None;
+            }
+            lower_y += 1
+        }
+
+        let mut upper_x = x - 1;
+        'outer: loop {
+            for x in 0..x {
+                let pos = UVec2::new(x, y);
+                if matches!(slef.get(pos), Some(GCell::Set)) {
+                    break 'outer;
+                }
+            }
+            if upper_y == 0 {
+                return *fles = None;
+            }
+            upper_y -= 1
+        }
+    }
 }
 
 impl<S: Shape<2, Coord = u32>> Index<UVec2> for Grid<S> {
@@ -292,7 +341,13 @@ impl<S: Shape<2, Coord = u32>> IndexMut<UVec2> for Grid<S> {
 
 pub fn spawn_world_grid(mut commands: Commands) {
     let grid = ConstGrid::new(SHAPE);
-    commands.spawn((grid, RigidBody::Static, WorldGrid, CollisionEventsEnabled));
+    commands.spawn((
+        grid,
+        RigidBody::Static,
+        WorldGrid,
+        Anchors,
+        CollisionEventsEnabled,
+    ));
 
     let size = SIZE as f32;
     let center = (size - 1.0) * 0.5;
@@ -327,10 +382,15 @@ pub fn spawn_world_grid(mut commands: Commands) {
     ]);
 }
 
-pub fn world_grid_collision_start<S: Shape<2, Coord = u32> + Send + Sync + 'static + Clone>(
+#[derive(Clone, Copy, Component)]
+pub struct Anchors;
+
+pub fn world_grid_collision_start<
+    S: Shape<2, Coord = u32> + Send + Sync + 'static + Clone + std::fmt::Debug,
+>(
     mut commands: Commands,
     mut events: MessageReader<CollisionStart>,
-    mut grids: Query<(Entity, &mut Grid<S>, &GlobalTransform)>,
+    mut grids: Query<(Entity, &mut Grid<S>, &GlobalTransform, Option<&Anchors>)>,
     collisions: Collisions,
     mut scratch: Local<super::Scratch>,
 ) {
@@ -344,23 +404,28 @@ pub fn world_grid_collision_start<S: Shape<2, Coord = u32> + Send + Sync + 'stat
         else {
             continue;
         };
-        let Ok((_, mut grid, transform)) = grids.get_mut(grid_entity) else {
+        let Ok((_, mut grid, transform, anchors)) = grids.get_mut(grid_entity) else {
             continue;
         };
         let Some(contact_pair) = collisions.get(event.collider1, event.collider2) else {
             continue;
         };
+        let local_from_world = transform.affine().inverse();
+        let grid_first = contact_pair.collider1 == grid_entity;
         for manifold in &contact_pair.manifolds {
             super::initalize_scratch(&grid, &mut scratch);
             for point in &manifold.points {
+                let impulse_world =
+                    manifold.normal * point.normal_impulse * if grid_first { -1. } else { 1. };
                 super::add_impulse(
                     &grid,
                     &mut scratch,
-                    (point.normal_impulse * manifold.normal).truncate(),
-                    point.point.truncate(),
+                    local_from_world.transform_vector3(impulse_world).truncate(),
+                    local_from_world.transform_point3(point.point).truncate(),
                 );
             }
-            let result = super::solve(&mut grid, &mut scratch, 10);
+            let result = super::solve(&mut grid, &mut scratch, 10, anchors.is_some());
+
             for (grid, collider, lin, ang) in result {
                 let solution = super::projection::solve(
                     grid.shape.clone(),
