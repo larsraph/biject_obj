@@ -9,8 +9,8 @@ mod render;
 
 use crate::{
     grid::{
-        Const, Dyn, DynGrid, GCell, Grid, recalculate_bijection, spawn_world_grid,
-        update_colliders, world_grid_collision_start,
+        Collisions, Const, Dyn, DynGrid, GCell, Grid, handle_grid_collisions,
+        recalculate_bijection, spawn_world_grid, update_colliders, world_grid_collision_start,
     },
     input::{
         Brush, MouseTarget, Selection, clamp_velocities, draw_selection, edit,
@@ -30,6 +30,7 @@ fn main() {
         .init_resource::<Brush>()
         .init_resource::<Selection>()
         .init_resource::<MouseTarget>()
+        .init_resource::<Collisions>()
         .add_systems(Startup, (spawn_world_grid, render_setup))
         .add_systems(Update, update_mouse_rigid_body)
         .add_systems(
@@ -41,10 +42,17 @@ fn main() {
         .add_systems(
             PostUpdate,
             (
-                (
-                    world_grid_collision_start::<Const>,
-                    world_grid_collision_start::<Dyn>,
-                ),
+                world_grid_collision_start,
+                handle_grid_collisions::<Const>,
+                handle_grid_collisions::<Dyn>,
+            )
+                .chain()
+                .after(PhysicsSet::StepSimulation)
+                .before(PhysicsSet::Writeback),
+        )
+        .add_systems(
+            PostUpdate,
+            (
                 recalculate_bijection,
                 edit,
                 update_colliders,
@@ -58,7 +66,7 @@ fn main() {
 
 use ndshape::Shape;
 
-const MAX_TRANSFER: f32 = 1.;
+const MAX_TRANSFER: f32 = 1e-2;
 
 #[derive(Default)]
 struct Scratch {
@@ -112,7 +120,7 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
     scratch: &mut Scratch,
     n: usize,
     anchors_boundary: bool,
-) -> impl Iterator<Item = (DynGrid, Collider, Velocity)> {
+) -> impl Iterator<Item = (DynGrid, Collider, Velocity, Vec3)> {
     // iterativly solve
     for _ in 0..n {
         // for every constraint try to equalize the velocities
@@ -264,7 +272,7 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
         for x in 0..x_size {
             let pos = UVec2::new(x, y);
             let idx = grid.shape.linearize(pos) as usize;
-            if !scratch.visited[idx] {
+            if !scratch.visited[idx] && grid[pos] == GCell::Set {
                 if scratch.cell[idx].abs().cmpge(Vec2::splat(1e-5)).any() {
                     fn flood<S: Shape<2, Coord = u32>>(
                         cell: UVec2,
@@ -340,7 +348,17 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
                         for cell in &blob_vec {
                             grid.paint_cell(cell.truncate().as_uvec2(), GCell::Unset);
                         }
-                        blobs.push((blob_vec, blob_grid));
+                        let Some((sub_rect, blob_grid)) = blob_grid.shrink_to_fit() else {
+                            error!("How did it shrink to nothing? {:?}", blob_vec);
+                            continue;
+                        };
+                        let origin = sub_rect.min;
+
+                        // TODO: see if this can be lazy
+                        for cell in &mut blob_vec {
+                            *cell = cell.wrapping_sub_unsigned(origin.extend(0));
+                        }
+                        blobs.push((blob_vec, origin, blob_grid));
                     }
                 }
             }
@@ -348,7 +366,7 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
     }
 
     // accumulate rotation and linear velocity from cellular velocity for each blob
-    blobs.into_iter().map(|(cells, blob_grid)| {
+    blobs.into_iter().map(|(cells, origin, blob_grid)| {
         // AI helped out here
         let collider = Collider::voxels(Vec3::ONE, &cells);
         // A unit voxel with density one has unit mass. Its center is at its
@@ -372,7 +390,8 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
                     let velocity = scratch.cell[idx].extend(0.0);
                     // `Collider::voxels` interprets an integer coordinate as the
                     // voxel's lower corner, so use its center for the moment arm.
-                    let cell_center = (pos.as_vec2() + Vec2::splat(0.5)).extend(0.0);
+                    let cell_center =
+                        (pos.as_vec2() + Vec2::splat(0.5) - origin.as_vec2()).extend(0.0);
                     let cell_momentum = cell_mass * velocity;
 
                     linear_momentum += cell_momentum;
@@ -389,13 +408,17 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
             // center is 1/6; add the parallel-axis contribution for the blob.
             inertia + 1.0 / 6.0 + (center - center_of_mass).truncate().length_squared()
         });
-        let angular_velocity =
-            Vec3::Z * (angular_momentum.z / principal_angular_inertia_z);
+        let angular_velocity = Vec3::Z * (angular_momentum.z / principal_angular_inertia_z);
 
-        (blob_grid, collider, Velocity {
-            linear: linear_velocity,
-            angular: angular_velocity,
-        })
+        (
+            blob_grid,
+            collider,
+            Velocity {
+                linear: linear_velocity,
+                angular: angular_velocity,
+            },
+            origin.as_vec2().extend(0.),
+        )
     })
 }
 
@@ -437,7 +460,7 @@ mod tests {
         assert_eq!(grid[UVec2::new(0, 1)], GCell::Set);
         assert_eq!(grid[UVec2::new(1, 1)], GCell::Set);
         assert_eq!(grid[UVec2::new(2, 1)], GCell::Unset);
-        assert_eq!(fragments[0].0[UVec2::new(2, 1)], GCell::Set);
+        assert_eq!(fragments[0].0[UVec2::ZERO], GCell::Set);
     }
 
     #[test]
@@ -455,5 +478,16 @@ mod tests {
         let fragments = solve(&mut grid, &mut scratch, 10, true).collect::<Vec<_>>();
         assert!(fragments.is_empty());
         assert_eq!(grid[UVec2::new(2, 1)], GCell::Set);
+    }
+
+    #[test]
+    fn an_impulse_on_an_empty_cell_does_not_extract_a_fragment() {
+        let shape = RuntimeShape::<u32, 2>::new([2, 2]);
+        let mut grid = Grid::new(shape);
+        let mut scratch = Scratch::default();
+        initalize_scratch(&grid, &mut scratch);
+        scratch.cell[0] = Vec2::X;
+
+        assert!(solve(&mut grid, &mut scratch, 1, true).next().is_none());
     }
 }

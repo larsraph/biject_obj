@@ -1,4 +1,4 @@
-use bevy::{math::CompassQuadrant, prelude::*};
+use bevy::{math::CompassQuadrant, platform::collections::HashSet, prelude::*};
 use bevy_rapier3d::prelude::*;
 use bitvec::{bitbox, boxed::BitBox};
 use ndshape::{ConstPow2Shape2u32, RuntimeShape, Shape};
@@ -197,7 +197,8 @@ impl<S: Shape<2, Coord = u32>> Grid<S> {
     }
 
     pub fn extract_rect(&mut self, rect: URect) -> Option<DynGrid> {
-        if !self.contains(rect.max) {
+        let size = UVec2::from(self.shape.as_array());
+        if rect.min.cmpgt(rect.max).any() || rect.max.cmpgt(size).any() {
             return None;
         }
         let size = rect.size();
@@ -274,53 +275,48 @@ impl<S: Shape<2, Coord = u32>> Grid<S> {
         }
     }
 
-    pub fn shrink_to_fit(fles: &mut Option<Self>) {
-        let Some(slef) = fles else {
-            return;
+    pub fn shrink_to_fit(mut self) -> Option<(URect, DynGrid)> {
+        let [x, y] = self.shape.as_array();
+
+        // returns the y-coordinate which has a set cell
+        let y_fn = |start_incl: u32, stop_excl: u32, step: i32| -> Option<u32> {
+            let mut y = start_incl;
+            loop {
+                for x in 0..x {
+                    let pos = UVec2::new(x, y);
+                    if matches!(self.get(pos), Some(GCell::Set)) {
+                        return Some(y);
+                    }
+                }
+                if y == stop_excl {
+                    return None;
+                }
+                y = y.wrapping_add_signed(step)
+            }
         };
-        let [x, y] = slef.shape.as_array();
+        let upper_y = y_fn(y - 1, 0, -1)?;
+        let lower_y = y_fn(0, y - 1, 1)?;
 
-        let mut upper_y = y - 1;
-        'outer: loop {
-            for x in 0..x {
-                let pos = UVec2::new(x, y);
-                if matches!(slef.get(pos), Some(GCell::Set)) {
-                    break 'outer;
+        let x_fn = |start_incl: u32, stop_excl: u32, step: i32| -> Option<u32> {
+            let mut x = start_incl;
+            loop {
+                for y in lower_y..=upper_y {
+                    let pos = UVec2::new(x, y);
+                    if matches!(self.get(pos), Some(GCell::Set)) {
+                        return Some(x);
+                    }
                 }
+                if x == stop_excl {
+                    return None;
+                }
+                x = x.wrapping_add_signed(step)
             }
-            if upper_y == 0 {
-                return *fles = None;
-            }
-            upper_y -= 1
-        }
+        };
+        let upper_x = x_fn(x - 1, 0, -1)?;
+        let lower_x = x_fn(0, x - 1, 1)?;
 
-        let mut lower_y = 0;
-        'outer: loop {
-            for x in 0..x {
-                let pos = UVec2::new(x, y);
-                if matches!(slef.get(pos), Some(GCell::Set)) {
-                    break 'outer;
-                }
-            }
-            if lower_y == y - 1 {
-                return *fles = None;
-            }
-            lower_y += 1
-        }
-
-        let mut upper_x = x - 1;
-        'outer: loop {
-            for x in 0..x {
-                let pos = UVec2::new(x, y);
-                if matches!(slef.get(pos), Some(GCell::Set)) {
-                    break 'outer;
-                }
-            }
-            if upper_y == 0 {
-                return *fles = None;
-            }
-            upper_y -= 1
-        }
+        let rect = URect::new(lower_x, lower_y, upper_x + 1, upper_y + 1);
+        Some((rect, self.extract_rect(rect).expect("at least 1 cell")))
     }
 }
 
@@ -361,21 +357,25 @@ pub fn spawn_world_grid(mut commands: Commands) {
         (
             RigidBody::Fixed,
             Collider::cuboid(BOUNDARY_THICKNESS, outer_length, 1.0),
+            ActiveEvents::COLLISION_EVENTS,
             Transform::from_xyz(low_edge, center, 0.0),
         ),
         (
             RigidBody::Fixed,
             Collider::cuboid(BOUNDARY_THICKNESS, outer_length, 1.0),
+            ActiveEvents::COLLISION_EVENTS,
             Transform::from_xyz(high_edge, center, 0.0),
         ),
         (
             RigidBody::Fixed,
             Collider::cuboid(outer_length, BOUNDARY_THICKNESS, 1.0),
+            ActiveEvents::COLLISION_EVENTS,
             Transform::from_xyz(center, low_edge, 0.0),
         ),
         (
             RigidBody::Fixed,
             Collider::cuboid(outer_length, BOUNDARY_THICKNESS, 1.0),
+            ActiveEvents::COLLISION_EVENTS,
             Transform::from_xyz(center, high_edge, 0.0),
         ),
     ]);
@@ -384,78 +384,91 @@ pub fn spawn_world_grid(mut commands: Commands) {
 #[derive(Clone, Copy, Component)]
 pub struct Anchors;
 
-pub fn world_grid_collision_start<
+#[derive(Resource, Default)]
+pub struct Collisions {
+    set: HashSet<(Entity, Entity)>,
+}
+
+pub fn handle_grid_collisions<
     S: Shape<2, Coord = u32> + Send + Sync + 'static + Clone + std::fmt::Debug,
 >(
+    collisions: Res<Collisions>,
     mut commands: Commands,
-    mut events: MessageReader<CollisionEvent>,
     mut grids: Query<(Entity, &mut Grid<S>, &GlobalTransform, Option<&Anchors>)>,
     rapier_context: ReadRapierContext,
     mut scratch: Local<super::Scratch>,
 ) {
     let Ok(rapier_context) = rapier_context.single() else {
+        error!("IDK how to handle multiple contexts");
         return;
     };
+    for (a, b) in collisions.set.iter().copied() {
+        for grid_entity in [a, b] {
+            let Ok((_, mut grid, transform, anchors)) = grids.get_mut(grid_entity) else {
+                continue;
+            };
+            let local_from_world = transform.affine().inverse();
 
-    for event in events.read() {
-        let CollisionEvent::Started(collider1, collider2, _) = *event else {
-            continue;
-        };
-        // A collision has one relevant grid, not two. Pick the first participant
-        // that carries this concrete `Grid<S>` component; the other can be a
-        // mouse collider, a wall, or a grid with another shape type.
-        let Some(grid_entity) = [collider1, collider2]
-            .into_iter()
-            .find(|&entity| grids.contains(entity))
-        else {
-            continue;
-        };
-        let Ok((_, mut grid, transform, anchors)) = grids.get_mut(grid_entity) else {
-            continue;
-        };
-        let Some(contact_pair) = rapier_context.contact_pair(collider1, collider2) else {
-            continue;
-        };
-        let local_from_world = transform.affine().inverse();
-        let grid_first = contact_pair.collider1() == Some(grid_entity);
-        for manifold in contact_pair.manifolds() {
-            super::initalize_scratch(&grid, &mut scratch);
-            for point in manifold.points() {
-                let impulse_world =
-                    manifold.normal() * point.impulse() * if grid_first { -1. } else { 1. };
-                let point_world = if grid_first {
-                    transform.transform_point(point.local_p1())
-                } else {
-                    transform.transform_point(point.local_p2())
-                };
-                super::add_impulse(
-                    &grid,
-                    &mut scratch,
-                    local_from_world.transform_vector3(impulse_world).truncate(),
-                    local_from_world.transform_point3(point_world).truncate(),
-                );
+            let Some(contact_pair) = rapier_context.contact_pair(a, b) else {
+                error!("Expected contact pair");
+                continue;
+            };
+            let grid_first = contact_pair.collider1() == Some(grid_entity);
+
+            for manifold in contact_pair.manifolds() {
+                super::initalize_scratch(&grid, &mut scratch);
+                for point in manifold.points() {
+                    let impulse_world =
+                        manifold.normal() * point.impulse() * if grid_first { 1. } else { -1. };
+                    let point_world = if grid_first {
+                        transform.transform_point(point.local_p1())
+                    } else {
+                        transform.transform_point(point.local_p2())
+                    };
+                    super::add_impulse(
+                        &grid,
+                        &mut scratch,
+                        local_from_world.transform_vector3(impulse_world).truncate(),
+                        local_from_world.transform_point3(point_world).truncate(),
+                    );
+                }
+                let result = super::solve(&mut grid, &mut scratch, 10, anchors.is_some());
+                for (grid, collider, velocity, offset) in result {
+                    let solution = super::projection::solve(
+                        grid.shape.clone(),
+                        Quat::default(),
+                        transform.translation_vec3a(),
+                    );
+                    commands.spawn((
+                        grid,
+                        collider,
+                        velocity,
+                        Transform::from_translation(transform.translation() + offset),
+                        RigidBody::Dynamic,
+                        ObjGrid,
+                        LockedAxes::TRANSLATION_LOCKED_Z
+                            | LockedAxes::ROTATION_LOCKED_X
+                            | LockedAxes::ROTATION_LOCKED_Y,
+                        Bijection(solution),
+                        ActiveEvents::COLLISION_EVENTS,
+                    ));
+                }
             }
-            let result = super::solve(&mut grid, &mut scratch, 10, anchors.is_some());
+        }
+    }
+}
 
-            for (grid, collider, velocity) in result {
-                let solution = super::projection::solve(
-                    grid.shape.clone(),
-                    Quat::default(),
-                    transform.translation_vec3a(),
-                );
-                commands.spawn((
-                    grid,
-                    collider,
-                    velocity,
-                    Transform::from_translation(transform.translation()),
-                    RigidBody::Dynamic,
-                    ObjGrid,
-                    LockedAxes::TRANSLATION_LOCKED_Z
-                        | LockedAxes::ROTATION_LOCKED_X
-                        | LockedAxes::ROTATION_LOCKED_Y,
-                    Bijection(solution),
-                    ActiveEvents::COLLISION_EVENTS,
-                ));
+pub fn world_grid_collision_start(
+    mut events: MessageReader<CollisionEvent>,
+    mut collisions: ResMut<Collisions>,
+) {
+    for event in events.read() {
+        match event {
+            CollisionEvent::Started(a, b, _) => {
+                collisions.set.insert((*a, *b));
+            }
+            CollisionEvent::Stopped(a, b, _) => {
+                collisions.set.remove(&(*a, *b));
             }
         }
     }

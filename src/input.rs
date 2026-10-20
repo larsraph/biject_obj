@@ -76,6 +76,8 @@ pub fn update_mouse_rigid_body(
             MouseFollower,
             RigidBody::Dynamic,
             Collider::ball(0.5),
+            ActiveEvents::COLLISION_EVENTS,
+            Ccd::enabled(),
             Transform::from_translation(position),
             Velocity::zero(),
             GravityScale(0.0),
@@ -187,6 +189,7 @@ pub fn edit(
                                 Transform::from_translation(translation),
                                 Bijection(solution),
                                 ColliderMassProperties::Mass(mass),
+                                ActiveEvents::COLLISION_EVENTS,
                             ));
                         }
                     }
