@@ -2,7 +2,7 @@ use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
 use crate::{
-    grid::{Bijection, ConstGrid, GCell, ObjGrid, WorldGrid},
+    grid::{Bijection, Cell, Grid, ObjGrid, WorldGrid},
     projection::solve,
 };
 
@@ -30,14 +30,6 @@ pub struct MouseTarget(pub Option<Vec3>);
 
 #[derive(Component)]
 pub struct MouseFollower;
-
-/// Rapier has no built-in velocity-limit components, so retain Avian's per-body
-/// caps with an equivalent clamp before each simulation step.
-#[derive(Component)]
-pub struct VelocityCap {
-    linear: f32,
-    angular: f32,
-}
 
 /// Creates the right-click physics body and updates the target it follows.
 pub fn update_mouse_rigid_body(
@@ -108,22 +100,15 @@ pub fn move_mouse_rigid_body(
     }
 }
 
-pub fn clamp_velocities(mut bodies: Query<(&mut Velocity, &VelocityCap)>) {
-    for (mut velocity, cap) in &mut bodies {
-        velocity.linear = velocity.linear.clamp_length_max(cap.linear);
-        velocity.angular = velocity.angular.clamp_length_max(cap.angular);
-    }
-}
-
 pub fn edit(
     mut commands: Commands,
     window: Single<&Window>,
     camera: Single<(&Camera, &GlobalTransform)>,
-    mut world: Single<&mut ConstGrid, With<WorldGrid>>,
+    mut world: Single<&mut Grid, With<WorldGrid>>,
     mbi: Res<ButtonInput<MouseButton>>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut brush: ResMut<Brush>,
-    mut last: Local<Option<(GCell, Vec2)>>,
+    mut last: Local<Option<(Cell, Vec2)>>,
     mut selection: ResMut<Selection>,
 ) -> Result<(), BevyError> {
     if keyboard.just_pressed(KeyCode::Equal) || keyboard.just_pressed(KeyCode::NumpadAdd) {
@@ -165,8 +150,7 @@ pub fn edit(
                         let rect = URect::from_corners(p0, p1);
                         let objgrid = world.extract_rect(rect);
                         if let Some(objgrid) = objgrid {
-                            let mass = objgrid.mass();
-                            let Some(collider) = objgrid.collider() else {
+                            let Some(collider) = objgrid.build_collider() else {
                                 return Ok(());
                             };
 
@@ -179,16 +163,11 @@ pub fn edit(
                                 objgrid,
                                 collider,
                                 RigidBody::Dynamic,
-                                VelocityCap {
-                                    linear: 100.0,
-                                    angular: 20.0,
-                                },
                                 LockedAxes::TRANSLATION_LOCKED_Z
                                     | LockedAxes::ROTATION_LOCKED_X
                                     | LockedAxes::ROTATION_LOCKED_Y,
                                 Transform::from_translation(translation),
                                 Bijection(solution),
-                                ColliderMassProperties::Mass(mass),
                                 ActiveEvents::COLLISION_EVENTS,
                             ));
                         }
@@ -199,14 +178,16 @@ pub fn edit(
         }
 
         if let Some((_, lpos)) = &mut *last {
-            world.set_brush_line(*lpos, pos, brush.radius, GCell::Set);
+            world.set_brush_line(*lpos, pos, brush.radius, Some(()));
 
             *lpos = pos;
         } else {
-            *last = Some((GCell::Set, pos));
+            *last = Some((Some(()), pos));
 
-            world.set_brush(pos, brush.radius, GCell::Set);
+            world.set_brush(pos, brush.radius, Some(()));
         }
+    } else if selection_ended {
+        selection.0 = None;
     };
     Ok(())
 }

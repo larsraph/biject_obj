@@ -1,177 +1,157 @@
 use bevy::{math::CompassQuadrant, platform::collections::HashSet, prelude::*};
 use bevy_rapier3d::prelude::*;
 use bitvec::{bitbox, boxed::BitBox};
-use ndshape::{ConstPow2Shape2u32, RuntimeShape, Shape};
+use ndshape::{RuntimeShape, Shape};
 use std::ops::{Index, IndexMut};
 
-use crate::projection::{Solution, solve};
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum GCell {
-    Set,
-    Unset,
-}
+use crate::{All as _, ToIVec2 as _, projection};
 
 pub const SIZE_LOG2: u32 = 8;
 pub const SIZE: u32 = 1 << SIZE_LOG2;
-pub const _SIZE_POW2: u32 = SIZE * SIZE;
-pub type S = ConstPow2Shape2u32<SIZE_LOG2, SIZE_LOG2>;
-pub const SHAPE: S = S {};
+
+pub type CellInner = ();
+pub type Cell = Option<CellInner>;
 
 #[derive(Component)]
 pub struct WorldGrid;
+
 #[derive(Component)]
 pub struct ObjGrid;
-
-pub type Const = ConstPow2Shape2u32<SIZE_LOG2, SIZE_LOG2>;
-pub type ConstGrid = Grid<Const>;
-pub type Dyn = RuntimeShape<u32, 2>;
-pub type DynGrid = Grid<Dyn>;
 
 const BOUNDARY_THICKNESS: f32 = 1.0;
 
 #[derive(Component, Debug)]
-pub struct Grid<S> {
-    pub ty: Box<[GCell]>,
-    pub connection: BitBox,
-    pub shape: S,
+pub struct Grid {
+    pub values: Box<[Cell]>,
+    pub edges: BitBox,
+    pub shape: RuntimeShape<u32, 2>,
 }
 
-impl<S: Shape<2, Coord = u32>> Grid<S> {
-    pub fn new(shape: S) -> Self {
+impl Grid {
+    pub fn new(shape: RuntimeShape<u32, 2>) -> Self {
         Self {
-            ty: vec![GCell::Unset; shape.usize()].into_boxed_slice(),
-            connection: bitbox!(0; 2 * shape.usize()),
+            values: vec![None; shape.usize()].into_boxed_slice(),
+            edges: bitbox!(0; 2 * shape.usize()),
             shape,
         }
     }
 
-    pub fn _take_from<D: Shape<2, Coord = u32>>(&mut self, other: &mut Grid<D>, pos: UVec2) {
-        let index = self.linearize(pos).unwrap();
-        self.ty[index] = other.ty[index];
-        other.ty[index] = GCell::Unset;
+    pub fn size(&self) -> UVec2 {
+        UVec2::from(self.shape.as_array())
     }
 
     pub fn contains(&self, pos: UVec2) -> bool {
-        let bound = UVec2::from(self.shape.as_array());
-        pos.cmplt(bound).all()
+        pos.cmplt(self.size()).all()
     }
 
-    pub fn linearize(&self, pos: UVec2) -> Option<usize> {
-        self.contains(pos)
-            .then_some(self.shape.linearize(pos) as usize)
+    pub fn linearize(&self, pos: UVec2) -> usize {
+        self.shape.linearize(pos) as usize
     }
 
-    pub fn linearize_conn(&self, pos: UVec2, y: bool) -> Option<usize> {
-        self.linearize(pos).map(|idx| (idx << 1) | (y as usize))
+    pub fn linearize_checked(&self, pos: UVec2) -> Option<usize> {
+        self.contains(pos).then_some(self.linearize(pos))
     }
 
-    pub fn get(&self, pos: UVec2) -> Option<&GCell> {
-        let index = self.linearize(pos)?;
+    #[track_caller]
+    pub fn linearize_expect(&self, pos: UVec2) -> usize {
+        assert!(self.contains(pos), "{:?} oob of {:?}", pos, self.size());
+        self.linearize(pos)
+    }
+
+    pub fn linearize_edge(&self, pos: UVec2, dir: CompassQuadrant) -> (usize, UVec2) {
+        let (lin_off, bit_0) = match dir {
+            CompassQuadrant::North => (IVec2::ZERO, 0b1),
+            CompassQuadrant::East => (IVec2::ZERO, 0b0),
+            CompassQuadrant::South => (IVec2::NEG_Y, 0b1),
+            CompassQuadrant::West => (IVec2::NEG_X, 0b0),
+        };
+        let pos = pos.wrapping_add_signed(lin_off);
+        let idx = self.linearize(pos);
+        ((idx << 1) | bit_0, pos)
+    }
+
+    pub fn linearize_edge_checked(&self, pos: UVec2, dir: CompassQuadrant) -> Option<usize> {
+        let (idx, pos) = self.linearize_edge(pos, dir);
+        self.contains(pos).then_some(idx)
+    }
+
+    pub fn linearize_edge_expect(&self, pos: UVec2, dir: CompassQuadrant) -> usize {
+        let (idx, pos) = self.linearize_edge(pos, dir);
+        let contains = self.contains(pos);
+        let size = self.size();
+        assert!(contains, "{:?} edge {:?} oob of {:?}", pos, dir, size);
+        idx
+    }
+
+    #[track_caller]
+    pub fn get(&self, pos: UVec2) -> &Cell {
+        let index = self.linearize_expect(pos);
         // SAFETY: index is checked to be within bounds by linearize
-        Some(unsafe { self.ty.get_unchecked(index) })
+        unsafe { self.values.get_unchecked(index) }
     }
 
-    pub fn get_mut(&mut self, pos: UVec2) -> Option<&mut GCell> {
-        let index = self.linearize(pos)?;
+    #[track_caller]
+    pub fn get_mut(&mut self, pos: UVec2) -> &mut Cell {
+        let index = self.linearize_expect(pos);
         // SAFETY: index is checked to be within bounds by linearize
-        Some(unsafe { self.ty.get_unchecked_mut(index) })
+        unsafe { self.values.get_unchecked_mut(index) }
+    }
+
+    #[track_caller]
+    pub fn get_edge(&self, pos: UVec2, dir: CompassQuadrant) -> bool {
+        let index = self.linearize_edge_expect(pos, dir);
+        // SAFETY: index is checked to be within bounds by linearize
+        unsafe { *self.edges.get_unchecked(index) }
+    }
+
+    #[track_caller]
+    pub fn set_edge(&mut self, pos: UVec2, dir: CompassQuadrant, connected: bool) {
+        let index = self.linearize_edge_expect(pos, dir);
+        // SAFETY: index is checked to be within bounds by linearize
+        unsafe { self.edges.set_unchecked(index, connected) }
     }
 
     /// Edits one cell and keeps the four incident bonds consistent with occupancy.
     ///
-    /// Painting a new cell bonds it to each existing orthogonal neighbor. Erasing a
-    /// cell removes every bond that touches it. Repainting an existing cell leaves
-    /// its bonds alone, so a brush stroke does not silently repair a fractured bond.
-    pub fn paint_cell(&mut self, pos: UVec2, to: GCell) {
-        let Some(index) = self.linearize(pos) else {
+    /// Painting a new cell bonds it to each existing orthogonal equal neighbor.
+    pub fn paint_cell(&mut self, pos: UVec2, to: Cell) {
+        let Some(index) = self.linearize_checked(pos) else {
             return;
         };
 
-        let previous = self.ty[index];
-        if previous == to {
-            return;
-        }
-        self.ty[index] = to;
+        self.values[index] = to;
 
-        // Edges are stored at the cell on their negative side: X/Y for right/down,
-        // and the neighbor's X/Y edge for left/up.
-        for (offset, is_y) in [
-            (IVec2::X, false),
-            (IVec2::Y, true),
-            (IVec2::NEG_X, false),
-            (IVec2::NEG_Y, true),
-        ] {
-            let Some(neighbor) = pos.checked_add_signed(offset) else {
+        for &quadrant in CompassQuadrant::ALL {
+            let Some(edge_index) = self.linearize_edge_checked(pos, quadrant) else {
                 continue;
             };
-            let Some(neighbor_index) = self.linearize(neighbor) else {
-                continue;
-            };
+            let adj = pos.wrapping_add_signed(quadrant.ivec2());
+            let adj_index = self.linearize(adj);
 
-            let edge_owner = if offset.x < 0 || offset.y < 0 {
-                neighbor
-            } else {
-                pos
-            };
-            let edge_index = self.linearize_conn(edge_owner, is_y).unwrap();
-            let connected = to == GCell::Set && self.ty[neighbor_index] == GCell::Set;
-            self.connection.set(edge_index, connected);
+            let value = to.is_some() && self.values[adj_index] == to;
+            self.edges.set(edge_index, value);
         }
     }
 
-    pub fn is_connected_raw(&self, pos: UVec2, y: bool) -> Option<bool> {
-        let index = self.linearize_conn(pos, y)?;
-        // SAFETY: index is checked to be within bounds by linearize
-        Some(unsafe { *self.connection.get_unchecked(index) })
+    pub fn iter_set_positions(&self) -> impl Iterator<Item = UVec2> + '_ {
+        let size = self.size();
+        (0..size.y)
+            .flat_map(move |y| (0..size.x).map(move |x| UVec2::new(x, y)))
+            .filter(|&pos| self.values[self.linearize(pos)].is_some())
     }
 
-    pub fn is_connected(&self, pos: UVec2, quad: CompassQuadrant) -> Option<bool> {
-        match quad {
-            CompassQuadrant::North => pos
-                .checked_add_signed(IVec2::NEG_Y)
-                .and_then(|neighbor| self.is_connected_raw(neighbor, true)),
-            CompassQuadrant::South => self.is_connected_raw(pos, true),
-            CompassQuadrant::East => self.is_connected_raw(pos, false),
-            CompassQuadrant::West => pos
-                .checked_add_signed(IVec2::NEG_X)
-                .and_then(|neighbor| self.is_connected_raw(neighbor, false)),
-        }
-    }
-
-    pub fn set_connection(&mut self, pos: UVec2, quad: CompassQuadrant, connected: bool) {
-        let (offset, is_y) = match quad {
-            CompassQuadrant::North => (IVec2::NEG_Y, true),
-            CompassQuadrant::South => (IVec2::ZERO, true),
-            CompassQuadrant::East => (IVec2::ZERO, false),
-            CompassQuadrant::West => (IVec2::NEG_X, false),
-        };
-        let owner = pos.checked_add_signed(offset).unwrap();
-        let index = self.linearize_conn(owner, is_y).unwrap();
-        self.connection.set(index, connected);
-    }
-
-    pub fn iter_set_positions(&self) -> impl Iterator<Item = IVec2> + '_ {
-        let [x, y] = self.shape.as_array();
-        (0..y)
-            .flat_map(move |y| (0..x).map(move |x| UVec2::new(x, y)))
-            .filter(|&pos| matches!(self.ty[self.shape.linearize(pos) as usize], GCell::Set))
-            .map(|pos| pos.as_ivec2())
-    }
-
-    pub fn set_brush(&mut self, center: Vec2, radius: i32, to: GCell) {
+    pub fn set_brush(&mut self, center: Vec2, radius: i32, to: Cell) {
         let center = center.round().as_ivec2();
         for y in -radius..=radius {
             for x in -radius..=radius {
                 let cell = center + IVec2::new(x, y);
-                if let Ok(cell) = cell.try_into() {
-                    self.paint_cell(cell, to);
-                }
+                self.paint_cell(cell.as_uvec2(), to);
             }
         }
     }
 
-    pub fn set_brush_line(&mut self, start: Vec2, end: Vec2, radius: i32, to: GCell) {
+    // I understand the theory of how to traverse voxels but not the implementation.
+    pub fn set_brush_line(&mut self, start: Vec2, end: Vec2, radius: i32, to: Cell) {
         let mut cell = start.round().as_ivec2();
         let end = end.round().as_ivec2();
         let delta = (end - cell).abs();
@@ -196,154 +176,122 @@ impl<S: Shape<2, Coord = u32>> Grid<S> {
         }
     }
 
-    pub fn extract_rect(&mut self, rect: URect) -> Option<DynGrid> {
-        let size = UVec2::from(self.shape.as_array());
-        if rect.min.cmpgt(rect.max).any() || rect.max.cmpgt(size).any() {
-            return None;
+    /// Sets the edges around this rectangle to disconnected.
+    pub fn disconnect_rect(&mut self, rect: URect) {
+        // top and bottom row
+        for y in [rect.min.y - 1, rect.max.y - 1] {
+            for x in rect.min.x..rect.max.x {
+                let pos = UVec2::new(x, y);
+                self.set_edge(pos, CompassQuadrant::North, false);
+            }
         }
+        // right and left row
+        for y in rect.min.y..rect.max.y {
+            for x in [rect.min.x - 1, rect.max.x - 1] {
+                let pos = UVec2::new(x, y);
+                self.set_edge(pos, CompassQuadrant::East, false);
+            }
+        }
+    }
+
+    pub fn copy_rect(&mut self, rect: URect) -> (bool, Self) {
         let size = rect.size();
 
         let shape = RuntimeShape::<u32, 2>::new(size);
-        let mut grid = DynGrid::new(shape);
+        let mut grid = Grid::new(shape);
+
+        let mut any = false;
 
         for y in 0..size.y {
             for x in 0..size.x {
                 let lpos = UVec2::new(x, y);
                 let wpos = lpos + rect.min;
 
-                grid[lpos] = self[wpos];
-            }
-        }
+                let value = self[wpos];
+                grid[lpos] = value;
+                any |= value.is_some();
 
-        // Copy only bonds wholly inside the selection. Every incident source-grid
-        // bond is then cleared as its cell is removed, which severs the selection
-        // from the world without damaging its internal connectivity.
-        for y in 0..size.y {
-            for x in 0..size.x {
-                // Painting a new cell bonds it to each existing orthogonal neighbor. Erasing a
-                let lpos = UVec2::new(x, y);
-                let wpos = lpos + rect.min;
-                if grid[lpos] != GCell::Set {
-                    continue;
-                }
-
-                for (offset, is_y, direction) in [
-                    (UVec2::X, false, CompassQuadrant::East),
-                    (UVec2::Y, true, CompassQuadrant::South),
-                ] {
-                    let neighbor = lpos + offset;
-                    if neighbor.cmplt(size).all()
-                        && grid[neighbor] == GCell::Set
-                        && self.is_connected_raw(wpos, is_y) == Some(true)
-                    {
-                        grid.set_connection(lpos, direction, true);
+                for quad in [CompassQuadrant::North, CompassQuadrant::East] {
+                    if self.get_edge(wpos, quad) {
+                        grid.set_edge(lpos, quad, true);
                     }
                 }
             }
         }
 
-        for y in 0..size.y {
-            for x in 0..size.x {
-                self.paint_cell(UVec2::new(x, y) + rect.min, GCell::Unset);
-            }
-        }
-
-        let has_voxels = grid.iter_set_positions().next().is_some();
-        has_voxels.then_some(grid)
+        (any, grid)
     }
 
-    pub fn collider(&self) -> Option<Collider> {
+    pub fn clear_rect(&mut self, rect: URect) {
+        for y in rect.min.y..rect.max.y {
+            for x in rect.min.x..rect.max.x {
+                let pos = UVec2::new(x, y);
+                self[pos] = None;
+                for quad in [CompassQuadrant::North, CompassQuadrant::East] {
+                    self.set_edge(pos, quad, false);
+                }
+            }
+        }
+    }
+
+    pub fn extract_rect(&mut self, rect: URect) -> Option<Self> {
+        self.disconnect_rect(rect);
+        let (any, grid) = self.copy_rect(rect);
+        if !any {
+            return None;
+        }
+        self.clear_rect(rect);
+        Some(grid)
+    }
+
+    pub fn build_collider(&self) -> Option<Collider> {
         let voxels = self
             .iter_set_positions()
-            .map(|position| position.extend(0))
+            .map(|position| position.as_ivec2().extend(0))
             .collect::<Vec<_>>();
 
         (!voxels.is_empty()).then(|| Collider::voxels(Vec3::ONE, &voxels))
     }
 
-    pub fn mass(&self) -> f32 {
-        self.iter_set_positions().count() as f32
-    }
+    pub fn shrink_to_fit(mut self) -> Option<(UVec2, Self)> {
+        let mut cells = self.iter_set_positions();
+        let first = cells.next()?;
+        let (min, max) = cells.fold((first, first), |(min, max), cell| {
+            (min.min(cell), max.max(cell))
+        });
 
-    pub fn to_dyn(self) -> DynGrid {
-        let [x, y] = self.shape.as_array();
-        let shape = RuntimeShape::<u32, 2>::new([x, y]);
-        DynGrid {
-            shape,
-            ty: self.ty,
-            connection: self.connection,
-        }
-    }
-
-    pub fn shrink_to_fit(mut self) -> Option<(URect, DynGrid)> {
-        let [x, y] = self.shape.as_array();
-
-        // returns the y-coordinate which has a set cell
-        let y_fn = |start_incl: u32, stop_excl: u32, step: i32| -> Option<u32> {
-            let mut y = start_incl;
-            loop {
-                for x in 0..x {
-                    let pos = UVec2::new(x, y);
-                    if matches!(self.get(pos), Some(GCell::Set)) {
-                        return Some(y);
-                    }
-                }
-                if y == stop_excl {
-                    return None;
-                }
-                y = y.wrapping_add_signed(step)
-            }
-        };
-        let upper_y = y_fn(y - 1, 0, -1)?;
-        let lower_y = y_fn(0, y - 1, 1)?;
-
-        let x_fn = |start_incl: u32, stop_excl: u32, step: i32| -> Option<u32> {
-            let mut x = start_incl;
-            loop {
-                for y in lower_y..=upper_y {
-                    let pos = UVec2::new(x, y);
-                    if matches!(self.get(pos), Some(GCell::Set)) {
-                        return Some(x);
-                    }
-                }
-                if x == stop_excl {
-                    return None;
-                }
-                x = x.wrapping_add_signed(step)
-            }
-        };
-        let upper_x = x_fn(x - 1, 0, -1)?;
-        let lower_x = x_fn(0, x - 1, 1)?;
-
-        let rect = URect::new(lower_x, lower_y, upper_x + 1, upper_y + 1);
-        Some((rect, self.extract_rect(rect).expect("at least 1 cell")))
+        // `URect` has an exclusive maximum, while `max` is an occupied cell.
+        let rect = URect::from_corners(min, max + UVec2::ONE);
+        let (non_empty, shrunk) = self.copy_rect(rect);
+        debug_assert!(non_empty, "{:?}", rect);
+        Some((min, shrunk))
     }
 }
 
-impl<S: Shape<2, Coord = u32>> Index<UVec2> for Grid<S> {
-    type Output = GCell;
+impl Index<UVec2> for Grid {
+    type Output = Cell;
 
     fn index(&self, pos: UVec2) -> &Self::Output {
-        self.get(pos).unwrap()
+        self.get(pos)
     }
 }
 
-impl<S: Shape<2, Coord = u32>> IndexMut<UVec2> for Grid<S> {
+impl IndexMut<UVec2> for Grid {
     fn index_mut(&mut self, pos: UVec2) -> &mut Self::Output {
-        self.get_mut(pos).unwrap()
+        self.get_mut(pos)
     }
 }
 
 pub fn spawn_world_grid(mut commands: Commands) {
-    let grid = ConstGrid::new(SHAPE);
     commands.spawn((
-        grid,
-        RigidBody::Fixed,
         WorldGrid,
-        Anchors,
+        Grid::new(RuntimeShape::<u32, 2>::new([SIZE, SIZE])),
+        RigidBody::Fixed,
         ActiveEvents::COLLISION_EVENTS,
     ));
+}
 
+pub fn spawn_edge_colliders(mut commands: Commands) {
     let size = SIZE as f32;
     let center = (size - 1.0) * 0.5;
     let outer_length = size + 2.0 * BOUNDARY_THICKNESS;
@@ -381,30 +329,41 @@ pub fn spawn_world_grid(mut commands: Commands) {
     ]);
 }
 
-#[derive(Clone, Copy, Component)]
-pub struct Anchors;
-
 #[derive(Resource, Default)]
 pub struct Collisions {
     set: HashSet<(Entity, Entity)>,
 }
 
-pub fn handle_grid_collisions<
-    S: Shape<2, Coord = u32> + Send + Sync + 'static + Clone + std::fmt::Debug,
->(
-    collisions: Res<Collisions>,
+pub fn on_world_grid_collision(
+    mut events: MessageReader<CollisionEvent>,
+    mut collisions: ResMut<Collisions>,
+) {
+    for event in events.read() {
+        match event {
+            CollisionEvent::Started(a, b, _) => {
+                collisions.set.insert((*a, *b));
+            }
+            CollisionEvent::Stopped(a, b, _) => {
+                collisions.set.remove(&(*a, *b));
+            }
+        }
+    }
+}
+
+pub fn handle_grid_collisions(
     mut commands: Commands,
-    mut grids: Query<(Entity, &mut Grid<S>, &GlobalTransform, Option<&Anchors>)>,
+    collisions: Res<Collisions>,
+    mut grids: Query<(&mut Grid, &GlobalTransform, Option<&WorldGrid>)>,
     rapier_context: ReadRapierContext,
     mut scratch: Local<super::Scratch>,
 ) {
     let Ok(rapier_context) = rapier_context.single() else {
-        error!("IDK how to handle multiple contexts");
+        error!("Multiple contexts");
         return;
     };
     for (a, b) in collisions.set.iter().copied() {
         for grid_entity in [a, b] {
-            let Ok((_, mut grid, transform, anchors)) = grids.get_mut(grid_entity) else {
+            let Ok((mut grid, transform, anchors)) = grids.get_mut(grid_entity) else {
                 continue;
             };
             let local_from_world = transform.affine().inverse();
@@ -420,11 +379,12 @@ pub fn handle_grid_collisions<
                 for point in manifold.points() {
                     let impulse_world =
                         manifold.normal() * point.impulse() * if grid_first { 1. } else { -1. };
-                    let point_world = if grid_first {
-                        transform.transform_point(point.local_p1())
+                    let p = if grid_first {
+                        point.local_p1()
                     } else {
-                        transform.transform_point(point.local_p2())
+                        point.local_p2()
                     };
+                    let point_world = transform.transform_point(p);
                     super::add_impulse(
                         &grid,
                         &mut scratch,
@@ -458,62 +418,32 @@ pub fn handle_grid_collisions<
     }
 }
 
-pub fn world_grid_collision_start(
-    mut events: MessageReader<CollisionEvent>,
-    mut collisions: ResMut<Collisions>,
-) {
-    for event in events.read() {
-        match event {
-            CollisionEvent::Started(a, b, _) => {
-                collisions.set.insert((*a, *b));
-            }
-            CollisionEvent::Stopped(a, b, _) => {
-                collisions.set.remove(&(*a, *b));
-            }
-        }
-    }
-}
-
 pub fn update_colliders(
     mut commands: Commands,
-    mut colliders: Query<&mut Collider>,
-    consts: Query<(Entity, &ConstGrid), Changed<ConstGrid>>,
-    dyns: Query<(Entity, &DynGrid), Changed<DynGrid>>,
+    mut query: Query<(Entity, &Grid, Option<&mut Collider>), Changed<Grid>>,
 ) {
-    for (entity, grid) in consts.iter() {
-        match (colliders.get_mut(entity).ok(), grid.collider()) {
-            (Some(mut trgt), Some(src)) => *trgt = src,
+    for (entity, grid, collider) in query.iter_mut() {
+        match (collider, grid.build_collider()) {
+            (Some(mut old), Some(new)) => *old = new,
             (Some(_), None) => {
                 commands.entity(entity).remove::<Collider>();
             }
-            (None, Some(src)) => {
-                commands.entity(entity).insert(src);
-            }
-            (None, None) => {}
-        }
-    }
-    for (entity, grid) in dyns.iter() {
-        match (colliders.get_mut(entity).ok(), grid.collider()) {
-            (Some(mut trgt), Some(src)) => *trgt = src,
-            (Some(_), None) => {
-                commands.entity(entity).remove::<Collider>();
-            }
-            (None, Some(src)) => {
-                commands.entity(entity).insert(src);
+            (None, Some(new)) => {
+                commands.entity(entity).insert(new);
             }
             (None, None) => {}
         }
     }
 }
 
-#[derive(Component)]
-pub struct Bijection(pub Solution);
+#[derive(Component, Deref, DerefMut)]
+pub struct Bijection(pub projection::Solution);
 
 pub fn recalculate_bijection(
-    mut query: Query<(&GlobalTransform, &DynGrid, &mut Bijection), With<ObjGrid>>,
+    mut query: Query<(&GlobalTransform, &Grid, &mut Bijection), With<ObjGrid>>,
 ) {
     for (transform, grid, mut bijection) in query.iter_mut() {
-        bijection.0 = solve(
+        bijection.0 = projection::solve(
             grid.shape.clone(),
             transform.rotation(),
             transform.translation_vec3a(),

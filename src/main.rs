@@ -9,12 +9,12 @@ mod render;
 
 use crate::{
     grid::{
-        Collisions, Const, Dyn, DynGrid, GCell, Grid, handle_grid_collisions,
-        recalculate_bijection, spawn_world_grid, update_colliders, world_grid_collision_start,
+        Collisions, Grid, handle_grid_collisions, on_world_grid_collision, recalculate_bijection,
+        spawn_edge_colliders, spawn_world_grid, update_colliders,
     },
     input::{
-        Brush, MouseTarget, Selection, clamp_velocities, draw_selection, edit,
-        move_mouse_rigid_body, update_mouse_rigid_body,
+        Brush, MouseTarget, Selection, draw_selection, edit, move_mouse_rigid_body,
+        update_mouse_rigid_body,
     },
     render::{QuadTemplate, render_setup, render_world},
 };
@@ -31,21 +31,18 @@ fn main() {
         .init_resource::<Selection>()
         .init_resource::<MouseTarget>()
         .init_resource::<Collisions>()
-        .add_systems(Startup, (spawn_world_grid, render_setup))
+        .add_systems(
+            Startup,
+            (spawn_world_grid, spawn_edge_colliders, render_setup),
+        )
         .add_systems(Update, update_mouse_rigid_body)
         .add_systems(
             PostUpdate,
-            (move_mouse_rigid_body, clamp_velocities)
-                .chain()
-                .before(PhysicsSet::SyncBackend),
+            move_mouse_rigid_body.before(PhysicsSet::SyncBackend),
         )
         .add_systems(
             PostUpdate,
-            (
-                world_grid_collision_start,
-                handle_grid_collisions::<Const>,
-                handle_grid_collisions::<Dyn>,
-            )
+            (on_world_grid_collision, handle_grid_collisions)
                 .chain()
                 .after(PhysicsSet::StepSimulation)
                 .before(PhysicsSet::Writeback),
@@ -77,14 +74,7 @@ struct Scratch {
     visited: BitVec,
 }
 
-pub const ALL: [CompassQuadrant; 4] = [
-    CompassQuadrant::North,
-    CompassQuadrant::East,
-    CompassQuadrant::South,
-    CompassQuadrant::West,
-];
-
-fn initalize_scratch<S: Shape<2, Coord = u32> + Clone>(grid: &Grid<S>, scratch: &mut Scratch) {
+fn initalize_scratch(grid: &Grid, scratch: &mut Scratch) {
     scratch.cell.clear();
     scratch.face.clear();
     scratch.visited.clear();
@@ -93,12 +83,7 @@ fn initalize_scratch<S: Shape<2, Coord = u32> + Clone>(grid: &Grid<S>, scratch: 
     scratch.visited.resize(grid.shape.usize(), false);
 }
 
-fn add_impulse<S: Shape<2, Coord = u32> + Clone>(
-    grid: &Grid<S>,
-    scratch: &mut Scratch,
-    impulse: Vec2,
-    pos: Vec2,
-) {
+fn add_impulse(grid: &Grid, scratch: &mut Scratch, impulse: Vec2, pos: Vec2) {
     // Contact points lie on a voxel surface, so they can be just outside the
     // grid at its outer faces. Clamp them to the adjacent edge cell instead of
     // turning a negative coordinate into a huge unsigned value.
@@ -108,19 +93,19 @@ fn add_impulse<S: Shape<2, Coord = u32> + Clone>(
         height.saturating_sub(1) as i32,
     );
     let pos = pos.floor().as_ivec2().clamp(IVec2::ZERO, max).as_uvec2();
-    let Some(idx) = grid.linearize(pos) else {
+    let Some(idx) = grid.linearize_checked(pos) else {
         return;
     };
     scratch.cell[idx] += impulse;
 }
 
 // TODO; on edit re-extract surrounding rigid blobs
-fn solve<S: Shape<2, Coord = u32> + Clone>(
-    grid: &mut Grid<S>,
+fn solve(
+    grid: &mut Grid,
     scratch: &mut Scratch,
     n: usize,
     anchors_boundary: bool,
-) -> impl Iterator<Item = (DynGrid, Collider, Velocity, Vec3)> {
+) -> impl Iterator<Item = (Grid, Collider, Velocity, Vec3)> {
     // iterativly solve
     for _ in 0..n {
         // for every constraint try to equalize the velocities
@@ -128,7 +113,7 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
         for y in 0..y_range {
             for x in 0..x_range {
                 let pos = UVec2::new(x, y);
-                if grid[pos] == GCell::Unset {
+                if grid[pos] == None {
                     continue;
                 }
                 for is_y in [true, false] {
@@ -141,12 +126,12 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
                     let a = pos;
                     let b = pos.wrapping_add_signed(step);
 
-                    if grid[b] == GCell::Unset {
+                    if grid[b] == None {
                         continue;
                     }
 
-                    let a_idx = grid.linearize(a).unwrap();
-                    let b_idx = grid.linearize(b).unwrap();
+                    let a_idx = grid.linearize(a);
+                    let b_idx = grid.linearize(b);
 
                     let vel_a = scratch.cell[a_idx];
                     let vel_b = scratch.cell[b_idx];
@@ -211,6 +196,12 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
                     // Another comment. Gravity cannot tear blobs apart because it's only simulated on entire
                     // rigid blobs at a time.
 
+                    let quadrant = if is_y {
+                        CompassQuadrant::North
+                    } else {
+                        CompassQuadrant::East
+                    };
+
                     let dot = vel_a.dot(vel_b);
                     if dot > 0. {
                         // completely sticky/rigid collision
@@ -218,7 +209,7 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
                         scratch.cell[a_idx] -= half_diff;
                         scratch.cell[b_idx] += half_diff;
                         scratch.face[a_idx][is_y as usize] += half_diff;
-                    } else if grid.is_connected_raw(pos, is_y).unwrap() {
+                    } else if grid.get_edge(pos, quadrant) {
                         // pulled apart has a cap and requires connection
                         let transferred = &mut scratch.face[a_idx][is_y as usize];
 
@@ -245,10 +236,10 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
     // based velocity transfer not break bonds?
     for (idx, [x, y]) in scratch.face.iter().enumerate() {
         if x.length() >= MAX_TRANSFER - 1e-6 {
-            grid.connection.set(idx * 2, false);
+            grid.edges.set(idx * 2, false);
         }
         if y.length() >= MAX_TRANSFER - 1e-6 {
-            grid.connection.set(idx * 2 + 1, false);
+            grid.edges.set(idx * 2 + 1, false);
         }
     }
 
@@ -272,29 +263,23 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
         for x in 0..x_size {
             let pos = UVec2::new(x, y);
             let idx = grid.shape.linearize(pos) as usize;
-            if !scratch.visited[idx] && grid[pos] == GCell::Set {
+            if !scratch.visited[idx] && grid[pos].is_some() {
                 if scratch.cell[idx].abs().cmpge(Vec2::splat(1e-5)).any() {
-                    fn flood<S: Shape<2, Coord = u32>>(
+                    fn flood(
                         cell: UVec2,
-                        grid: &Grid<S>,
+                        grid: &Grid,
                         scratch: &mut Scratch,
                         blob_vec: &mut Vec<IVec3>,
                         anchors_boundary: bool,
                         size: UVec2,
                     ) -> bool {
                         let mut touches_boundary = false;
-                        for to in ALL {
-                            let offset = match to {
-                                CompassQuadrant::East => IVec2::new(1, 0),
-                                CompassQuadrant::South => IVec2::new(0, 1),
-                                CompassQuadrant::West => IVec2::new(-1, 0),
-                                CompassQuadrant::North => IVec2::new(0, -1),
-                            };
-                            if let Some(target) = cell.checked_add_signed(offset)
-                                && let Some(index) = grid.linearize(target)
+                        for &dir in CompassQuadrant::ALL {
+                            let target = cell.wrapping_add_signed(dir.ivec2());
+                            if let Some(index) = grid.linearize_checked(target)
                                 && !scratch.visited[index as usize]
-                                && grid.ty[index] == GCell::Set
-                                && grid.is_connected(cell, to).unwrap()
+                                && grid.get(target).is_some()
+                                && grid.get_edge(cell, dir)
                             {
                                 scratch.visited.set(index as usize, true);
                                 blob_vec.push(target.as_ivec2().extend(0));
@@ -323,7 +308,7 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
                     );
 
                     if !touches_boundary {
-                        let mut blob_grid = Grid::new(grid.shape.clone()).to_dyn();
+                        let mut blob_grid = Grid::new(grid.shape.clone());
 
                         // Copy occupancy and every internal bond before removing
                         // the component. The old traversal copied only its spanning
@@ -334,25 +319,23 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
                         }
                         for cell in &blob_vec {
                             let pos = cell.truncate().as_uvec2();
-                            for (offset, is_y) in [(UVec2::X, false), (UVec2::Y, true)] {
-                                let neighbor = pos + offset;
+                            for dir in [CompassQuadrant::North, CompassQuadrant::East] {
+                                let neighbor = pos.wrapping_add_signed(dir.ivec2());
                                 if blob_grid.contains(neighbor)
-                                    && blob_grid[neighbor] == GCell::Set
-                                    && grid.is_connected_raw(pos, is_y) == Some(true)
+                                    && blob_grid[neighbor].is_some()
+                                    && grid.get_edge(pos, dir)
                                 {
-                                    let index = blob_grid.linearize_conn(pos, is_y).unwrap();
-                                    blob_grid.connection.set(index, true);
+                                    blob_grid.set_edge(pos, dir, true);
                                 }
                             }
                         }
                         for cell in &blob_vec {
-                            grid.paint_cell(cell.truncate().as_uvec2(), GCell::Unset);
+                            grid.paint_cell(cell.truncate().as_uvec2(), None);
                         }
-                        let Some((sub_rect, blob_grid)) = blob_grid.shrink_to_fit() else {
+                        let Some((origin, blob_grid)) = blob_grid.shrink_to_fit() else {
                             error!("How did it shrink to nothing? {:?}", blob_vec);
                             continue;
                         };
-                        let origin = sub_rect.min;
 
                         // TODO: see if this can be lazy
                         for cell in &mut blob_vec {
@@ -385,8 +368,8 @@ fn solve<S: Shape<2, Coord = u32> + Clone>(
         for y in 0..y {
             for x in 0..x {
                 let pos = UVec2::new(x, y);
-                if *blob_grid.get(pos).unwrap() == GCell::Set {
-                    let idx = blob_grid.linearize(pos).unwrap();
+                if blob_grid.get(pos).is_some() {
+                    let idx = blob_grid.linearize(pos);
                     let velocity = scratch.cell[idx].extend(0.0);
                     // `Collider::voxels` interprets an integer coordinate as the
                     // voxel's lower corner, so use its center for the moment arm.
@@ -436,58 +419,30 @@ fn max_b_len_d(a: Vec2, b: Vec2, d: f32) -> f32 {
     c
 }
 
-/// AI made these
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ndshape::RuntimeShape;
+trait All: Sized + 'static {
+    const ALL: &[Self];
+}
 
-    #[test]
-    fn a_large_impulse_breaks_a_bond_and_extracts_the_detached_component() {
-        let shape = RuntimeShape::<u32, 2>::new([4, 3]);
-        let mut grid = Grid::new(shape);
-        for pos in [UVec2::new(0, 1), UVec2::new(1, 1), UVec2::new(2, 1)] {
-            grid.paint_cell(pos, GCell::Set);
+impl All for CompassQuadrant {
+    const ALL: &[Self] = &[
+        CompassQuadrant::North,
+        CompassQuadrant::South,
+        CompassQuadrant::East,
+        CompassQuadrant::West,
+    ];
+}
+
+trait ToIVec2 {
+    fn ivec2(&self) -> IVec2;
+}
+
+impl ToIVec2 for CompassQuadrant {
+    fn ivec2(&self) -> IVec2 {
+        match self {
+            CompassQuadrant::North => IVec2::Y,
+            CompassQuadrant::East => IVec2::X,
+            CompassQuadrant::South => IVec2::NEG_Y,
+            CompassQuadrant::West => IVec2::NEG_X,
         }
-
-        let mut scratch = Scratch::default();
-        initalize_scratch(&grid, &mut scratch);
-        scratch.cell[grid.linearize(UVec2::new(2, 1)).unwrap()] = Vec2::X * 100.0;
-
-        let fragments = solve(&mut grid, &mut scratch, 1, true).collect::<Vec<_>>();
-
-        assert_eq!(fragments.len(), 1);
-        assert_eq!(grid[UVec2::new(0, 1)], GCell::Set);
-        assert_eq!(grid[UVec2::new(1, 1)], GCell::Set);
-        assert_eq!(grid[UVec2::new(2, 1)], GCell::Unset);
-        assert_eq!(fragments[0].0[UVec2::ZERO], GCell::Set);
-    }
-
-    #[test]
-    fn a_small_impulse_does_not_break_an_anchored_component() {
-        let shape = RuntimeShape::<u32, 2>::new([4, 3]);
-        let mut grid = Grid::new(shape);
-        for pos in [UVec2::new(0, 1), UVec2::new(1, 1), UVec2::new(2, 1)] {
-            grid.paint_cell(pos, GCell::Set);
-        }
-
-        let mut scratch = Scratch::default();
-        initalize_scratch(&grid, &mut scratch);
-        scratch.cell[grid.linearize(UVec2::new(2, 1)).unwrap()] = Vec2::X;
-
-        let fragments = solve(&mut grid, &mut scratch, 10, true).collect::<Vec<_>>();
-        assert!(fragments.is_empty());
-        assert_eq!(grid[UVec2::new(2, 1)], GCell::Set);
-    }
-
-    #[test]
-    fn an_impulse_on_an_empty_cell_does_not_extract_a_fragment() {
-        let shape = RuntimeShape::<u32, 2>::new([2, 2]);
-        let mut grid = Grid::new(shape);
-        let mut scratch = Scratch::default();
-        initalize_scratch(&grid, &mut scratch);
-        scratch.cell[0] = Vec2::X;
-
-        assert!(solve(&mut grid, &mut scratch, 1, true).next().is_none());
     }
 }

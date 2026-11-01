@@ -91,12 +91,16 @@ impl Solution {
         Some(pos)
     }
 
-    pub fn _dst_to_src(&self, pos: IVec2) -> Option<UVec2> {
-        let local_pos = (pos - self.dst_origin).as_uvec2();
-        if !self.dst_shape.contains(local_pos) {
+    pub fn dst_to_src(&self, pos: IVec2) -> Option<UVec2> {
+        let local_dst = (pos - self.dst_origin).as_uvec2();
+        if !self.dst_shape.contains(local_dst) {
             return None;
         }
-        let dst_idx = self.dst_shape.linearize(local_pos) as usize;
+        self.local_dst_to_src(local_dst)
+    }
+
+    pub fn local_dst_to_src(&self, local_dst: UVec2) -> Option<UVec2> {
+        let dst_idx = self.dst_shape.linearize(local_dst) as usize;
         let src_idx = self._dst_to_src[dst_idx];
         // dst_cells are not guaranteed to map to src_cells
         if src_idx == u32::MAX {
@@ -104,6 +108,16 @@ impl Solution {
         }
         let pos = UVec2::from_array(self.src_shape.delinearize(src_idx));
         Some(pos)
+    }
+
+    pub fn iter_local_dst_mapping(&self) -> impl Iterator<Item = (UVec2, UVec2)> + '_ {
+        let [x, y] = self.dst_shape.as_array();
+        (0..y).flat_map(move |y| {
+            (0..x).filter_map(move |x| {
+                let local_dst = UVec2::new(x, y);
+                self.local_dst_to_src(local_dst).map(|src| (local_dst, src))
+            })
+        })
     }
 }
 

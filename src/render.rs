@@ -1,7 +1,9 @@
 use bevy::{camera::ScalingMode, math::CompassQuadrant, prelude::*};
 
-use crate::grid::{Bijection, ConstGrid, DynGrid, GCell, Grid, ObjGrid, SIZE, WorldGrid};
-use ndshape::Shape;
+use crate::{
+    All as _, ToIVec2 as _,
+    grid::{Bijection, Grid, ObjGrid, SIZE, WorldGrid},
+};
 
 const PX_PER_CELL: u32 = 4;
 
@@ -54,13 +56,13 @@ pub fn render_setup(mut commands: Commands) {
 pub fn render_world(
     mut commands: Commands,
     mut quads: Query<(Entity, &mut Transform), With<Quad>>,
-    world: Single<&ConstGrid, With<WorldGrid>>,
-    obj: Query<(&DynGrid, &Bijection, &GlobalTransform), With<ObjGrid>>,
+    world: Single<&Grid, With<WorldGrid>>,
+    obj: Query<(&Grid, &Bijection, &GlobalTransform), With<ObjGrid>>,
     template: Res<QuadTemplate>,
     mut gizmos: Gizmos,
 ) {
     let mut recycle = quads.iter_mut();
-    let mut quad = |pos: IVec2| {
+    let mut draw_quad = |pos: IVec2| {
         if let Some((_, mut recycle)) = recycle.next() {
             recycle.translation = pos.extend(0).as_vec3();
         } else {
@@ -71,19 +73,20 @@ pub fn render_world(
             ));
         }
     };
+
     for pos in world.iter_set_positions() {
-        quad(pos)
+        draw_quad(pos.as_ivec2())
     }
 
-    draw_grid_seams(world.into_inner(), &mut gizmos, |point| point);
+    draw_grid_seams(world.into_inner(), &mut gizmos);
 
     for (grid, bijection, transform) in obj.iter() {
         for cell in grid.iter_set_positions() {
-            if let Some(dst) = bijection.0.src_to_dst(cell.as_uvec2()) {
-                quad(dst)
+            if let Some(dst) = bijection.0.src_to_dst(cell) {
+                draw_quad(dst)
             }
         }
-        draw_object_seams(grid, bijection, transform, &mut gizmos);
+        draw_object_seams(grid, &mut gizmos, bijection, transform);
     }
 
     for (e, _) in recycle {
@@ -91,80 +94,62 @@ pub fn render_world(
     }
 }
 
-const FACES: [(CompassQuadrant, IVec2); 4] = [
-    (CompassQuadrant::North, IVec2::NEG_Y),
-    (CompassQuadrant::East, IVec2::X),
-    (CompassQuadrant::South, IVec2::Y),
-    (CompassQuadrant::West, IVec2::NEG_X),
-];
+fn should_draw_seam(grid: &Grid, pos: UVec2, direction: CompassQuadrant) -> bool {
+    if !matches!(direction, CompassQuadrant::North | CompassQuadrant::East) {
+        return false;
+    }
+    let neighbor = pos.wrapping_add_signed(direction.ivec2());
+    let is_set = grid.get(neighbor).is_some();
+    let is_connected = grid.get_edge(pos, direction);
 
-fn should_draw_seam<S: Shape<2, Coord = u32>>(
-    grid: &Grid<S>,
-    pos: UVec2,
-    direction: CompassQuadrant,
-    offset: IVec2,
-) -> bool {
-    let neighbor_is_set = pos
-        .checked_add_signed(offset)
-        .and_then(|neighbor| grid.get(neighbor))
-        == Some(&GCell::Set);
-
-    grid.is_connected(pos, direction) != Some(true)
-        && !(neighbor_is_set && matches!(direction, CompassQuadrant::North | CompassQuadrant::West))
+    is_set & is_connected
 }
 
-fn draw_grid_seams<S: Shape<2, Coord = u32>>(
-    grid: &Grid<S>,
-    gizmos: &mut Gizmos,
-    map_point: impl Fn(Vec2) -> Vec2,
-) {
-    for cell in grid.iter_set_positions() {
-        let pos = cell.as_uvec2();
-        let center = cell.as_vec2();
-        for (direction, offset) in FACES {
-            if !should_draw_seam(grid, pos, direction, offset) {
+fn draw_grid_seams(grid: &Grid, gizmos: &mut Gizmos) {
+    for pos in grid.iter_set_positions() {
+        let center = pos.as_vec2();
+        for direction in CompassQuadrant::ALL {
+            if !should_draw_seam(grid, pos, *direction) {
                 continue;
             }
 
-            let normal = offset.as_vec2();
-            let tangent = Vec2::new(-normal.y, normal.x) * 0.5;
-            let midpoint = center + normal * 0.5;
-            gizmos.line_2d(
-                map_point(midpoint - tangent),
-                map_point(midpoint + tangent),
-                Color::BLACK,
-            );
+            let half_normal = direction.ivec2().as_vec2() * 0.5;
+            let midpoint = center + half_normal;
+            let tangent = half_normal.yx();
+            gizmos.line_2d(midpoint - tangent, midpoint + tangent, Color::BLACK);
         }
     }
 }
 
 fn draw_object_seams(
-    grid: &DynGrid,
+    grid: &Grid,
+    gizmos: &mut Gizmos,
     bijection: &Bijection,
     transform: &GlobalTransform,
-    gizmos: &mut Gizmos,
 ) {
-    for cell in grid.iter_set_positions() {
-        let pos = cell.as_uvec2();
+    for pos in grid.iter_set_positions() {
         let Some(center) = bijection.0.src_to_dst(pos).map(|point| point.as_vec2()) else {
             continue;
         };
 
-        for (direction, offset) in FACES {
-            if !should_draw_seam(grid, pos, direction, offset) {
+        for direction in CompassQuadrant::ALL {
+            if !should_draw_seam(grid, pos, *direction) {
                 continue;
             }
 
-            let normal = pos
-                .checked_add_signed(offset)
-                .and_then(|neighbor| bijection.0.src_to_dst(neighbor))
-                .map(|neighbor| (neighbor.as_vec2() - center).normalize_or_zero())
-                .filter(|normal| *normal != Vec2::ZERO)
-                .unwrap_or_else(|| {
-                    (transform.rotation() * offset.as_vec2().extend(0.0)).truncate()
-                });
-            let tangent = Vec2::new(-normal.y, normal.x) * 0.5;
-            let midpoint = center + normal * 0.5;
+            let neighbor = pos.wrapping_add_signed(direction.ivec2());
+            let neighbor_dst = match bijection.0.src_to_dst(neighbor) {
+                Some(neighbor) => {
+                    let normal = (neighbor.as_vec2() - center).normalize_or_zero();
+                    (normal != Vec2::ZERO).then_some(normal)
+                }
+                None => None,
+            }
+            .unwrap_or_else(|| {
+                (transform.rotation() * direction.ivec2().as_vec2().extend(0.0)).truncate()
+            });
+            let tangent = neighbor_dst.yx() * 0.5;
+            let midpoint = center + neighbor_dst * 0.5;
             gizmos.line_2d(midpoint - tangent, midpoint + tangent, Color::BLACK);
         }
     }
