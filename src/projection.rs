@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 use ndshape::{RuntimeShape, Shape as _};
-use sparse_linear_assignment::{AuctionSolver as _, KhoslaSolver};
+use sparse_linear_assignment::{AuctionSolver, ForwardAuctionSolver};
 
 use crate::grid::Grid;
 
@@ -48,7 +48,7 @@ pub fn solve(grid: &Grid, rotation: Quat, translation: Vec3A) -> Solution {
     let num_rows = sources.len() as u32;
     let num_cols = dst_shape.size();
     let (mut solver, mut solution) =
-        KhoslaSolver::<u32>::new(sources.len(), num_cols as usize, sources.len() * 4);
+        ForwardAuctionSolver::<u32>::new(sources.len(), num_cols as usize, sources.len() * 4);
     solver.init(num_rows, num_cols).unwrap_or_else(|error| {
         panic!("projection initialization failed at {translation:?}, {rotation:?}: {error:?}")
     });
@@ -103,7 +103,7 @@ impl Solution {
         }
         let src_idx = self.src_shape.linearize(pos) as usize;
         let dst_idx = self.src_to_dst[src_idx];
-        // TODO: see invariant in solve() that should be upheld
+        // Empty source cells deliberately have no assignment.
         if dst_idx == u32::MAX {
             return None;
         }
