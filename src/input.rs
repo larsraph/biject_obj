@@ -1,8 +1,8 @@
-use bevy::prelude::*;
+use bevy::{ecs::system::SystemParam, prelude::*};
 use bevy_rapier3d::prelude::*;
 
 use crate::{
-    grid::{Bijection, Cell, Grid, ObjGrid, WorldGrid},
+    grid::{Bijection, Grid, ObjGrid, WorldGrid},
     projection::solve,
 };
 
@@ -100,6 +100,13 @@ pub fn move_mouse_rigid_body(
     }
 }
 
+#[derive(SystemParam)]
+pub struct EditorState<'w, 's> {
+    brush: ResMut<'w, Brush>,
+    selection: ResMut<'w, Selection>,
+    last: Local<'s, Option<Vec2>>,
+}
+
 pub fn edit(
     mut commands: Commands,
     window: Single<&Window>,
@@ -107,10 +114,13 @@ pub fn edit(
     mut world: Single<&mut Grid, With<WorldGrid>>,
     mbi: Res<ButtonInput<MouseButton>>,
     keyboard: Res<ButtonInput<KeyCode>>,
-    mut brush: ResMut<Brush>,
-    mut last: Local<Option<(Cell, Vec2)>>,
-    mut selection: ResMut<Selection>,
+    state: EditorState,
 ) -> Result<(), BevyError> {
+    let EditorState {
+        mut brush,
+        mut selection,
+        mut last,
+    } = state;
     if keyboard.just_pressed(KeyCode::Equal) || keyboard.just_pressed(KeyCode::NumpadAdd) {
         brush.radius += 1;
     }
@@ -142,47 +152,41 @@ pub fn edit(
                 let (_, end) = selection.0.get_or_insert((current, current));
                 *end = current;
             }
-            if selection_ended {
-                if let Some((start, _)) = selection.0.take() {
-                    if let Ok(p0) = start.try_into()
-                        && let Ok(p1) = current.try_into()
-                    {
-                        let rect = URect::from_corners(p0, p1);
-                        let objgrid = world.extract_rect(rect);
-                        if let Some(objgrid) = objgrid {
-                            let Some(collider) = objgrid.build_collider() else {
-                                return Ok(());
-                            };
-
-                            let translation = start.min(current).extend(0).as_vec3();
-                            let solution =
-                                solve(objgrid.shape.clone(), Quat::default(), translation.into());
-
-                            commands.spawn((
-                                ObjGrid,
-                                objgrid,
-                                collider,
-                                RigidBody::Dynamic,
-                                LockedAxes::TRANSLATION_LOCKED_Z
-                                    | LockedAxes::ROTATION_LOCKED_X
-                                    | LockedAxes::ROTATION_LOCKED_Y,
-                                Transform::from_translation(translation),
-                                Bijection(solution),
-                                ActiveEvents::COLLISION_EVENTS,
-                            ));
-                        }
-                    }
+            if selection_ended && let Some((start, _)) = selection.0.take() {
+                let max = world.size().as_ivec2();
+                let min = start.min(current).clamp(IVec2::ZERO, max).as_uvec2();
+                let max = (start.max(current) + IVec2::ONE)
+                    .clamp(IVec2::ZERO, max)
+                    .as_uvec2();
+                let rect = URect::from_corners(min, max);
+                if let Some(objgrid) = world.extract_rect(rect)
+                    && let Some(collider) = objgrid.build_collider()
+                {
+                    let translation = rect.min.as_vec2().extend(0.0);
+                    let solution = solve(objgrid.shape, Quat::IDENTITY, translation.into());
+                    commands.spawn((
+                        ObjGrid,
+                        objgrid,
+                        collider,
+                        RigidBody::Dynamic,
+                        LockedAxes::TRANSLATION_LOCKED_Z
+                            | LockedAxes::ROTATION_LOCKED_X
+                            | LockedAxes::ROTATION_LOCKED_Y,
+                        Transform::from_translation(translation),
+                        Bijection(solution),
+                        ActiveEvents::COLLISION_EVENTS,
+                    ));
                 }
             }
             return Ok(());
         }
 
-        if let Some((_, lpos)) = &mut *last {
+        if let Some(lpos) = &mut *last {
             world.set_brush_line(*lpos, pos, brush.radius, Some(()));
 
             *lpos = pos;
         } else {
-            *last = Some((Some(()), pos));
+            *last = Some(pos);
 
             world.set_brush(pos, brush.radius, Some(()));
         }

@@ -4,13 +4,15 @@ use sparse_linear_assignment::{AuctionSolver as _, KhoslaSolver};
 
 pub fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3A) -> Solution {
     assert!(
-        !translation
-            .floor()
-            .abs()
-            .cmpgt(Vec3A::splat(i32::MAX as f32))
-            .all()
+        translation.is_finite() && rotation.is_finite(),
+        "non-finite transform"
+    );
+    assert!(
+        translation.abs().cmplt(Vec3A::splat(i32::MAX as f32)).all(),
+        "translation out of range"
     );
     let [x, y] = src_shape.as_array();
+    assert!(x > 0 && y > 0, "cannot project an empty grid");
 
     let mut min = IVec2::MAX;
     let mut max = IVec2::MIN;
@@ -39,9 +41,9 @@ pub fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3A
 
     let (mut solver, mut solution) =
         KhoslaSolver::<u32>::new(row_capacity, column_capacity, arcs_capacity);
-    solver
-        .init(num_rows, num_cols)
-        .expect(&format!("pos: {:?}, rot: {:?}", translation, rotation));
+    solver.init(num_rows, num_cols).unwrap_or_else(|error| {
+        panic!("projection initialization failed at {translation:?}, {rotation:?}: {error:?}")
+    });
 
     for (idx, pos) in iter_tuple_idx_pos(&src_shape) {
         let point = pos.as_vec2();
@@ -60,7 +62,6 @@ pub fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3A
 
     Solution {
         src_to_dst: solution.person_to_object,
-        _dst_to_src: solution.object_to_person,
         src_shape,
         dst_shape,
         dst_origin,
@@ -68,8 +69,7 @@ pub fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3A
 }
 
 pub struct Solution {
-    pub src_to_dst: Vec<u32>,
-    pub _dst_to_src: Vec<u32>,
+    src_to_dst: Vec<u32>,
     src_shape: RuntimeShape<u32, 2>,
     dst_shape: RuntimeShape<u32, 2>,
     dst_origin: IVec2,
@@ -89,35 +89,6 @@ impl Solution {
         let local_pos = UVec2::from_array(self.dst_shape.delinearize(dst_idx));
         let pos = local_pos.as_ivec2() + self.dst_origin;
         Some(pos)
-    }
-
-    pub fn dst_to_src(&self, pos: IVec2) -> Option<UVec2> {
-        let local_dst = (pos - self.dst_origin).as_uvec2();
-        if !self.dst_shape.contains(local_dst) {
-            return None;
-        }
-        self.local_dst_to_src(local_dst)
-    }
-
-    pub fn local_dst_to_src(&self, local_dst: UVec2) -> Option<UVec2> {
-        let dst_idx = self.dst_shape.linearize(local_dst) as usize;
-        let src_idx = self._dst_to_src[dst_idx];
-        // dst_cells are not guaranteed to map to src_cells
-        if src_idx == u32::MAX {
-            return None;
-        }
-        let pos = UVec2::from_array(self.src_shape.delinearize(src_idx));
-        Some(pos)
-    }
-
-    pub fn iter_local_dst_mapping(&self) -> impl Iterator<Item = (UVec2, UVec2)> + '_ {
-        let [x, y] = self.dst_shape.as_array();
-        (0..y).flat_map(move |y| {
-            (0..x).filter_map(move |x| {
-                let local_dst = UVec2::new(x, y);
-                self.local_dst_to_src(local_dst).map(|src| (local_dst, src))
-            })
-        })
     }
 }
 
@@ -149,4 +120,32 @@ fn bilinear(vec: Vec2) -> [IVec2; 4] {
         Vec2::new(floor.x, ceil.y).as_ivec2(),
         ceil.as_ivec2(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integer_translation_maps_every_source_cell() {
+        let shape = RuntimeShape::<u32, 2>::new([3, 2]);
+        let solution = solve(shape, Quat::IDENTITY, Vec3A::new(-4.0, 7.0, 0.0));
+        for (_, pos) in iter_tuple_idx_pos(&shape) {
+            assert_eq!(
+                solution.src_to_dst(pos),
+                Some(pos.as_ivec2() + IVec2::new(-4, 7))
+            );
+        }
+        assert_eq!(solution.src_to_dst(UVec2::MAX), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot project an empty grid")]
+    fn empty_grid_is_rejected_before_corner_arithmetic() {
+        solve(
+            RuntimeShape::<u32, 2>::new([0, 2]),
+            Quat::IDENTITY,
+            Vec3A::ZERO,
+        );
+    }
 }

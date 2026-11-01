@@ -10,7 +10,7 @@ const PX_PER_CELL: u32 = 4;
 pub fn square_window() -> WindowPlugin {
     WindowPlugin {
         primary_window: Some(Window {
-            resolution: (SIZE as u32 * PX_PER_CELL + 2, SIZE as u32 * PX_PER_CELL + 2).into(),
+            resolution: (SIZE * PX_PER_CELL + 2, SIZE * PX_PER_CELL + 2).into(),
             ..default()
         }),
         ..default()
@@ -99,10 +99,10 @@ fn should_draw_seam(grid: &Grid, pos: UVec2, direction: CompassQuadrant) -> bool
         return false;
     }
     let neighbor = pos.wrapping_add_signed(direction.ivec2());
-    let is_set = grid.get(neighbor).is_some();
+    let is_set = grid.contains(neighbor) && grid[neighbor].is_some();
     let is_connected = grid.get_edge(pos, direction);
 
-    is_set & is_connected
+    is_set && is_connected
 }
 
 fn draw_grid_seams(grid: &Grid, gizmos: &mut Gizmos) {
@@ -115,7 +115,7 @@ fn draw_grid_seams(grid: &Grid, gizmos: &mut Gizmos) {
 
             let half_normal = direction.ivec2().as_vec2() * 0.5;
             let midpoint = center + half_normal;
-            let tangent = half_normal.yx();
+            let tangent = half_normal.perp();
             gizmos.line_2d(midpoint - tangent, midpoint + tangent, Color::BLACK);
         }
     }
@@ -148,9 +148,32 @@ fn draw_object_seams(
             .unwrap_or_else(|| {
                 (transform.rotation() * direction.ivec2().as_vec2().extend(0.0)).truncate()
             });
-            let tangent = neighbor_dst.yx() * 0.5;
+            let tangent = neighbor_dst.perp() * 0.5;
             let midpoint = center + neighbor_dst * 0.5;
             gizmos.line_2d(midpoint - tangent, midpoint + tangent, Color::BLACK);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndshape::RuntimeShape;
+
+    #[test]
+    fn seam_checks_handle_outer_edges_and_disconnected_cells() {
+        let mut grid = Grid::new(RuntimeShape::<u32, 2>::new([2, 2]));
+        grid.set_brush(Vec2::ZERO, 1, Some(()));
+        assert!(should_draw_seam(&grid, UVec2::ZERO, CompassQuadrant::North));
+        assert!(should_draw_seam(&grid, UVec2::ZERO, CompassQuadrant::East));
+        for &direction in CompassQuadrant::ALL {
+            assert!(!should_draw_seam(&grid, UVec2::ONE, direction));
+        }
+        grid.set_edge(UVec2::ZERO, CompassQuadrant::North, false);
+        assert!(!should_draw_seam(
+            &grid,
+            UVec2::ZERO,
+            CompassQuadrant::North
+        ));
     }
 }
