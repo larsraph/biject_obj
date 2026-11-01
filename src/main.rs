@@ -56,7 +56,7 @@ fn main() {
             (recalculate_bijection, (render_world, draw_selection))
                 .chain()
                 .after(PhysicsSet::Writeback)
-                .after(TransformSystems::Propagate),
+                .before(TransformSystems::Propagate),
         )
         .run();
 }

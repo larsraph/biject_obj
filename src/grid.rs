@@ -36,6 +36,10 @@ impl Grid {
         }
     }
 
+    pub fn is_1x1(&self) -> bool {
+        self.shape.as_array() == [1, 1]
+    }
+
     pub fn size(&self) -> UVec2 {
         UVec2::from(self.shape.as_array())
     }
@@ -124,7 +128,7 @@ impl Grid {
     }
 
     pub fn set_brush(&mut self, center: Vec2, radius: i32, to: Cell) {
-        let center = center.round().as_ivec2();
+        let center = center.floor().as_ivec2();
         for y in -radius..=radius {
             for x in -radius..=radius {
                 let cell = center + IVec2::new(x, y);
@@ -135,8 +139,8 @@ impl Grid {
 
     /// Paints a continuous line using Bresenham's algorithm.
     pub fn set_brush_line(&mut self, start: Vec2, end: Vec2, radius: i32, to: Cell) {
-        let mut cell = start.round().as_ivec2();
-        let end = end.round().as_ivec2();
+        let mut cell = start.floor().as_ivec2();
+        let end = end.floor().as_ivec2();
         let delta = (end - cell).abs();
         let step = (end - cell).signum();
         let mut error = delta.x - delta.y;
@@ -284,18 +288,19 @@ pub fn spawn_world_grid(mut commands: Commands) {
         WorldGrid,
         Grid::new(RuntimeShape::<u32, 2>::new([SIZE, SIZE])),
         RigidBody::Fixed,
+        Transform::default(),
         ActiveEvents::COLLISION_EVENTS,
     ));
 }
 
 pub fn spawn_edge_colliders(mut commands: Commands) {
     let size = SIZE as f32;
-    let center = (size - 1.0) * 0.5;
+    let center = size * 0.5;
     let outer_length = size + 2.0 * BOUNDARY_THICKNESS;
-    let low_edge = -0.5 - BOUNDARY_THICKNESS * 0.5;
-    let high_edge = size - 0.5 + BOUNDARY_THICKNESS * 0.5;
+    let low_edge = -BOUNDARY_THICKNESS * 0.5;
+    let high_edge = size + BOUNDARY_THICKNESS * 0.5;
 
-    // The grid occupies the square from -0.5 to SIZE - 0.5 on both axes.
+    // The grid occupies the square from 0 to SIZE on both axes.
     // These four static colliders meet that square at each edge, retaining
     // dynamic voxel objects within the playable area.
     commands.spawn_batch([
@@ -303,25 +308,25 @@ pub fn spawn_edge_colliders(mut commands: Commands) {
             RigidBody::Fixed,
             Collider::cuboid(BOUNDARY_THICKNESS * 0.5, outer_length * 0.5, 0.5),
             ActiveEvents::COLLISION_EVENTS,
-            Transform::from_xyz(low_edge, center, 0.0),
+            Transform::from_xyz(low_edge, center, 0.5),
         ),
         (
             RigidBody::Fixed,
             Collider::cuboid(BOUNDARY_THICKNESS * 0.5, outer_length * 0.5, 0.5),
             ActiveEvents::COLLISION_EVENTS,
-            Transform::from_xyz(high_edge, center, 0.0),
+            Transform::from_xyz(high_edge, center, 0.5),
         ),
         (
             RigidBody::Fixed,
             Collider::cuboid(outer_length * 0.5, BOUNDARY_THICKNESS * 0.5, 0.5),
             ActiveEvents::COLLISION_EVENTS,
-            Transform::from_xyz(center, low_edge, 0.0),
+            Transform::from_xyz(center, low_edge, 0.5),
         ),
         (
             RigidBody::Fixed,
             Collider::cuboid(outer_length * 0.5, BOUNDARY_THICKNESS * 0.5, 0.5),
             ActiveEvents::COLLISION_EVENTS,
-            Transform::from_xyz(center, high_edge, 0.0),
+            Transform::from_xyz(center, high_edge, 0.5),
         ),
     ]);
 }
@@ -371,8 +376,11 @@ pub fn handle_grid_collisions(
             };
             let grid_first = contact_pair.collider1() == Some(grid_entity);
 
+            if grid.is_1x1() {
+                continue;
+            }
+            crate::simulation::initialize_scratch(&grid, &mut scratch);
             for manifold in contact_pair.manifolds() {
-                crate::simulation::initialize_scratch(&grid, &mut scratch);
                 for point in manifold.points() {
                     let impulse_world =
                         manifold.normal() * point.impulse() * if grid_first { 1. } else { -1. };
@@ -389,38 +397,37 @@ pub fn handle_grid_collisions(
                         local_from_world.transform_point3(point_world).truncate(),
                     );
                 }
-                let result =
-                    crate::simulation::solve(&mut grid, &mut scratch, 10, anchors.is_some());
-                for (grid, collider, velocity, offset) in result {
-                    let object_transform = Transform {
-                        translation: transform.transform_point(offset),
-                        rotation: transform.rotation(),
-                        ..default()
-                    };
-                    let solution = projection::solve(
-                        grid.shape,
-                        object_transform.rotation,
-                        object_transform.translation.into(),
-                    );
-                    let rotation = object_transform.rotation;
-                    let velocity = Velocity {
-                        linear: rotation * velocity.linear,
-                        angular: rotation * velocity.angular,
-                    };
-                    commands.spawn((
-                        grid,
-                        collider,
-                        velocity,
-                        object_transform,
-                        RigidBody::Dynamic,
-                        ObjGrid,
-                        LockedAxes::TRANSLATION_LOCKED_Z
-                            | LockedAxes::ROTATION_LOCKED_X
-                            | LockedAxes::ROTATION_LOCKED_Y,
-                        Bijection(solution),
-                        ActiveEvents::COLLISION_EVENTS,
-                    ));
-                }
+            }
+            let result = crate::simulation::solve(&mut grid, &mut scratch, 10, anchors.is_some());
+            for (grid, collider, velocity, offset) in result {
+                let object_transform = Transform {
+                    translation: transform.transform_point(offset),
+                    rotation: transform.rotation(),
+                    ..default()
+                };
+                let solution = projection::solve(
+                    &grid,
+                    object_transform.rotation,
+                    object_transform.translation.into(),
+                );
+                let rotation = object_transform.rotation;
+                let velocity = Velocity {
+                    linear: rotation * velocity.linear,
+                    angular: rotation * velocity.angular,
+                };
+                commands.spawn((
+                    grid,
+                    collider,
+                    velocity,
+                    object_transform,
+                    RigidBody::Dynamic,
+                    ObjGrid,
+                    LockedAxes::TRANSLATION_LOCKED_Z
+                        | LockedAxes::ROTATION_LOCKED_X
+                        | LockedAxes::ROTATION_LOCKED_Y,
+                    Bijection(solution),
+                    ActiveEvents::COLLISION_EVENTS,
+                ));
             }
         }
     }
@@ -447,15 +454,9 @@ pub fn update_colliders(
 #[derive(Component, Deref, DerefMut)]
 pub struct Bijection(pub projection::Solution);
 
-pub fn recalculate_bijection(
-    mut query: Query<(&GlobalTransform, &Grid, &mut Bijection), With<ObjGrid>>,
-) {
+pub fn recalculate_bijection(mut query: Query<(&Transform, &Grid, &mut Bijection), With<ObjGrid>>) {
     for (transform, grid, mut bijection) in query.iter_mut() {
-        bijection.0 = projection::solve(
-            grid.shape,
-            transform.rotation(),
-            transform.translation_vec3a(),
-        )
+        bijection.0 = projection::solve(grid, transform.rotation, transform.translation.into())
     }
 }
 
@@ -523,5 +524,87 @@ mod tests {
         for &direction in CompassQuadrant::ALL {
             assert!(!grid.get_edge(UVec2::ONE, direction));
         }
+    }
+    #[test]
+    fn brush_uses_minimum_corner_cell_coordinates() {
+        let mut grid = grid([3, 2]);
+        grid.set_brush(Vec2::new(0.9, 0.9), 0, Some(()));
+        grid.set_brush(Vec2::new(-0.1, 0.1), 0, Some(()));
+        assert!(grid[UVec2::ZERO].is_some());
+        assert_eq!(grid.iter_set_positions().count(), 1);
+    }
+
+    #[test]
+    fn projection_and_display_transforms_are_current_before_extraction() {
+        use bevy::transform::{TransformPlugin, TransformSystems};
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, TransformPlugin));
+        let mut grid = grid([1, 1]);
+        grid.paint_cell(UVec2::ZERO, Some(()));
+        let bijection = Bijection(projection::solve(&grid, Quat::IDENTITY, Vec3A::ZERO));
+        let body = app
+            .world_mut()
+            .spawn((ObjGrid, grid, bijection, Transform::default()))
+            .id();
+        // Stand in for Rapier's writeback of the current simulation pose.
+        app.add_systems(
+            PostUpdate,
+            (|mut bodies: Query<&mut Transform, With<ObjGrid>>| {
+                for mut transform in &mut bodies {
+                    transform.translation = Vec3::new(4.0, 2.0, 0.0);
+                }
+            })
+            .in_set(PhysicsSet::Writeback),
+        );
+        let quad = app
+            .world_mut()
+            .spawn((crate::render::Quad, Transform::default()))
+            .id();
+        app.add_systems(
+            PostUpdate,
+            (
+                recalculate_bijection,
+                |bodies: Query<&Bijection, With<ObjGrid>>,
+                 mut quads: Query<&mut Transform, With<crate::render::Quad>>| {
+                    let pos = bodies.single().unwrap().src_to_dst(UVec2::ZERO).unwrap();
+                    quads.single_mut().unwrap().translation =
+                        (pos.as_vec2() + Vec2::splat(0.5)).extend(0.0);
+                },
+            )
+                .chain()
+                .after(PhysicsSet::Writeback)
+                .before(TransformSystems::Propagate),
+        );
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<Bijection>(body)
+                .unwrap()
+                .src_to_dst(UVec2::ZERO),
+            Some(IVec2::new(4, 2))
+        );
+        assert_eq!(
+            app.world()
+                .get::<GlobalTransform>(quad)
+                .unwrap()
+                .translation(),
+            Vec3::new(4.5, 2.5, 0.0)
+        );
+    }
+
+    #[test]
+    fn world_grid_is_visible_to_collision_processing_query() {
+        use bevy::transform::TransformPlugin;
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, TransformPlugin));
+        app.add_systems(Startup, spawn_world_grid);
+        app.update();
+        assert_eq!(
+            app.world_mut()
+                .query_filtered::<(&Grid, &GlobalTransform), With<WorldGrid>>()
+                .iter(app.world())
+                .count(),
+            1
+        );
     }
 }

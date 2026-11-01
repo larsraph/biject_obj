@@ -5,7 +5,7 @@ use ndshape::Shape;
 
 use crate::{All as _, ToIVec2 as _, grid::Grid};
 
-const MAX_TRANSFER: f32 = 1e-2;
+const MAX_TRANSFER: f32 = 10.;
 
 #[derive(Default)]
 pub(crate) struct Scratch {
@@ -126,6 +126,8 @@ pub(crate) fn solve(
     }
 
     // Extract moving connected components that are not anchored to the boundary.
+
+    // for non-boundaried blobs we sample a random blob as the base blob which doesn't need to be extracted
     let mut blobs = Vec::new();
     let [x_size, y_size] = grid.shape.as_array();
     let size = UVec2::new(x_size, y_size);

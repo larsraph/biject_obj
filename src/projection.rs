@@ -2,7 +2,10 @@ use bevy::prelude::*;
 use ndshape::{RuntimeShape, Shape as _};
 use sparse_linear_assignment::{AuctionSolver as _, KhoslaSolver};
 
-pub fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3A) -> Solution {
+use crate::grid::Grid;
+
+pub fn solve(grid: &Grid, rotation: Quat, translation: Vec3A) -> Solution {
+    let src_shape = grid.shape;
     assert!(
         translation.is_finite() && rotation.is_finite(),
         "non-finite transform"
@@ -31,28 +34,43 @@ pub fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3A
     let dst_size = (max - min).as_uvec2() + UVec2::ONE;
     let dst_shape = RuntimeShape::<u32, 2>::new(dst_size);
 
-    let num_rows = src_shape.size();
+    // Only occupied cells participate. The solver rejects empty rows.
+    let sources: Vec<_> = grid.iter_set_positions().collect();
+    let mut src_to_dst = vec![u32::MAX; src_shape.usize()];
+    if sources.is_empty() {
+        return Solution {
+            src_to_dst,
+            src_shape,
+            dst_shape,
+            dst_origin,
+        };
+    }
+    let num_rows = sources.len() as u32;
     let num_cols = dst_shape.size();
-
-    let row_capacity = num_rows as usize;
-    let column_capacity = num_cols as usize;
-    // bilinear sampling returns 4 points per source cell
-    let arcs_capacity = row_capacity * 4;
-
     let (mut solver, mut solution) =
-        KhoslaSolver::<u32>::new(row_capacity, column_capacity, arcs_capacity);
+        KhoslaSolver::<u32>::new(sources.len(), num_cols as usize, sources.len() * 4);
     solver.init(num_rows, num_cols).unwrap_or_else(|error| {
         panic!("projection initialization failed at {translation:?}, {rotation:?}: {error:?}")
     });
 
-    for (idx, pos) in iter_tuple_idx_pos(&src_shape) {
-        let point = pos.as_vec2();
-        let w_point = transform_point(rotation, translation, point);
-        let bilinear = bilinear(w_point);
-        let columns = bilinear.map(|w_pos| dst_shape.linearize((w_pos - dst_origin).as_uvec2()));
-        let values = bilinear.map(|w_pos| w_pos.as_vec2().distance_squared(w_point) as f64);
-        // this expects row major ordering which is ensured by the `bilinear` function
-        solver.extend_from_values(idx, &columns, &values).unwrap();
+    for (row, pos) in sources.iter().enumerate() {
+        let w_point = transform_point(rotation, translation, pos.as_vec2());
+        let candidates = bilinear(w_point);
+        let mut columns = [0; 4];
+        let mut values = [0.0; 4];
+        let mut count = 0;
+        for candidate in candidates {
+            let column = dst_shape.linearize((candidate - dst_origin).as_uvec2());
+            if columns[..count].contains(&column) {
+                continue;
+            }
+            columns[count] = column;
+            values[count] = candidate.as_vec2().distance_squared(w_point) as f64;
+            count += 1;
+        }
+        solver
+            .extend_from_values(row as u32, &columns[..count], &values[..count])
+            .unwrap();
     }
 
     solver.solve(&mut solution, false, None).unwrap();
@@ -60,8 +78,11 @@ pub fn solve(src_shape: RuntimeShape<u32, 2>, rotation: Quat, translation: Vec3A
     // TODO: unfortunately this invariant is NOT currently upheld by our solver.
     // assert_eq!(solution.num_unassigned, 0);
 
+    for (pos, destination) in sources.iter().zip(solution.person_to_object) {
+        src_to_dst[src_shape.linearize(*pos) as usize] = destination;
+    }
     Solution {
-        src_to_dst: solution.person_to_object,
+        src_to_dst,
         src_shape,
         dst_shape,
         dst_origin,
@@ -92,21 +113,15 @@ impl Solution {
     }
 }
 
-/// Copy of [`Transform::transform_point`] without scaling
-///
-/// Using [`Vec3A`] vectors because we have to convert anyway
+/// Transforms a voxel center and expresses it in destination minimum-corner coordinates.
 #[inline]
 fn transform_point(rotation: Quat, translation: Vec3A, point: Vec2) -> Vec2 {
-    let mut point = Vec3A::new(point.x, point.y, 0.);
+    // Source and destination integers identify minimum corners. Match the
+    // transformed voxel center to destination centers, then return corner space.
+    let mut point = Vec3A::new(point.x + 0.5, point.y + 0.5, 0.5);
     point = rotation * point;
     point += translation;
-    point.xy()
-}
-
-#[inline]
-fn iter_tuple_idx_pos(shape: &RuntimeShape<u32, 2>) -> impl Iterator<Item = (u32, UVec2)> + '_ {
-    let [x, y] = shape.as_array();
-    (0..y).flat_map(move |y| (0..x).map(move |x| (shape.linearize([x, y]), UVec2::new(x, y))))
+    point.xy() - Vec2::splat(0.5)
 }
 
 #[inline]
@@ -129,8 +144,10 @@ mod tests {
     #[test]
     fn integer_translation_maps_every_source_cell() {
         let shape = RuntimeShape::<u32, 2>::new([3, 2]);
-        let solution = solve(shape, Quat::IDENTITY, Vec3A::new(-4.0, 7.0, 0.0));
-        for (_, pos) in iter_tuple_idx_pos(&shape) {
+        let mut grid = Grid::new(shape);
+        grid.set_brush(Vec2::ZERO, 4, Some(()));
+        let solution = solve(&grid, Quat::IDENTITY, Vec3A::new(-4.0, 7.0, 0.0));
+        for pos in grid.iter_set_positions() {
             assert_eq!(
                 solution.src_to_dst(pos),
                 Some(pos.as_ivec2() + IVec2::new(-4, 7))
@@ -143,9 +160,44 @@ mod tests {
     #[should_panic(expected = "cannot project an empty grid")]
     fn empty_grid_is_rejected_before_corner_arithmetic() {
         solve(
-            RuntimeShape::<u32, 2>::new([0, 2]),
+            &Grid::new(RuntimeShape::<u32, 2>::new([0, 2])),
             Quat::IDENTITY,
             Vec3A::ZERO,
         );
+    }
+    #[test]
+    fn sparse_projection_only_assigns_occupied_cells() {
+        let mut grid = Grid::new(RuntimeShape::<u32, 2>::new([4, 3]));
+        grid.paint_cell(UVec2::new(2, 1), Some(()));
+        grid.paint_cell(UVec2::new(3, 2), Some(()));
+        let solution = solve(&grid, Quat::IDENTITY, Vec3A::ZERO);
+        assert_eq!(solution.src_to_dst(UVec2::ZERO), None);
+        assert_eq!(
+            solution.src_to_dst(UVec2::new(2, 1)),
+            Some(IVec2::new(2, 1))
+        );
+        assert_eq!(
+            solution.src_to_dst(UVec2::new(3, 2)),
+            Some(IVec2::new(3, 2))
+        );
+    }
+
+    #[test]
+    fn quarter_turn_projects_voxel_center_to_correct_minimum_corner() {
+        let mut grid = Grid::new(RuntimeShape::<u32, 2>::new([1, 1]));
+        grid.paint_cell(UVec2::ZERO, Some(()));
+        let solution = solve(
+            &grid,
+            Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+            Vec3A::ZERO,
+        );
+        assert_eq!(solution.src_to_dst(UVec2::ZERO), Some(IVec2::new(-1, 0)));
+    }
+
+    #[test]
+    fn empty_occupancy_does_not_enter_assignment_solver() {
+        let grid = Grid::new(RuntimeShape::<u32, 2>::new([2, 2]));
+        let solution = solve(&grid, Quat::IDENTITY, Vec3A::ZERO);
+        assert_eq!(solution.src_to_dst(UVec2::ZERO), None);
     }
 }

@@ -60,7 +60,7 @@ pub fn update_mouse_rigid_body(
     let Ok(position) = camera.viewport_to_world_2d(camera_transform, cursor_position) else {
         return;
     };
-    let position = position.extend(0.0);
+    let position = position.extend(0.5);
     target.0 = Some(position);
 
     if followers.is_empty() {
@@ -146,7 +146,7 @@ pub fn edit(
 
         if selecting || selection_ended {
             *last = None;
-            let current = pos.round().as_ivec2();
+            let current = pos.floor().as_ivec2();
 
             if selecting {
                 let (_, end) = selection.0.get_or_insert((current, current));
@@ -163,7 +163,7 @@ pub fn edit(
                     && let Some(collider) = objgrid.build_collider()
                 {
                     let translation = rect.min.as_vec2().extend(0.0);
-                    let solution = solve(objgrid.shape, Quat::IDENTITY, translation.into());
+                    let solution = solve(&objgrid, Quat::IDENTITY, translation.into());
                     commands.spawn((
                         ObjGrid,
                         objgrid,
@@ -202,10 +202,10 @@ pub fn draw_selection(mut gizmos: Gizmos, selection: Res<Selection>) {
     };
 
     let min = start.min(end).as_vec2();
-    let max = start.max(end).as_vec2();
+    let max = start.max(end).as_vec2() + Vec2::ONE;
     gizmos.rect_2d(
         Isometry2d::from_translation((min + max) * 0.5),
-        max - min + Vec2::ONE,
+        max - min,
         Color::srgb(0.2, 0.8, 1.0),
     );
 }

@@ -39,6 +39,8 @@ impl FromWorld for QuadBundle {
 #[derive(Component)]
 pub struct Quad;
 
+type DisplayQuadFilter = (With<Quad>, Without<ObjGrid>);
+
 pub fn render_setup(mut commands: Commands) {
     commands.spawn((
         Camera2d,
@@ -49,26 +51,27 @@ pub fn render_setup(mut commands: Commands) {
             },
             ..OrthographicProjection::default_2d()
         }),
-        Transform::from_xyz(SIZE as f32 / 2.0 - 0.5, SIZE as f32 / 2.0 - 0.5, 0.0),
+        Transform::from_xyz(SIZE as f32 / 2.0, SIZE as f32 / 2.0, 0.0),
     ));
 }
 
 pub fn render_world(
     mut commands: Commands,
-    mut quads: Query<(Entity, &mut Transform), With<Quad>>,
+    mut quads: Query<(Entity, &mut Transform), DisplayQuadFilter>,
     world: Single<&Grid, With<WorldGrid>>,
-    obj: Query<(&Grid, &Bijection, &GlobalTransform), With<ObjGrid>>,
+    obj: Query<(&Grid, &Bijection, &Transform), With<ObjGrid>>,
     template: Res<QuadTemplate>,
     mut gizmos: Gizmos,
 ) {
     let mut recycle = quads.iter_mut();
     let mut draw_quad = |pos: IVec2| {
+        let center = (pos.as_vec2() + Vec2::splat(0.5)).extend(0.0);
         if let Some((_, mut recycle)) = recycle.next() {
-            recycle.translation = pos.extend(0).as_vec3();
+            recycle.translation = center;
         } else {
             commands.spawn((
                 Quad,
-                Transform::from_translation(pos.extend(0).as_vec3()),
+                Transform::from_translation(center),
                 template.0.clone(),
             ));
         }
@@ -107,7 +110,7 @@ fn should_draw_seam(grid: &Grid, pos: UVec2, direction: CompassQuadrant) -> bool
 
 fn draw_grid_seams(grid: &Grid, gizmos: &mut Gizmos) {
     for pos in grid.iter_set_positions() {
-        let center = pos.as_vec2();
+        let center = pos.as_vec2() + Vec2::splat(0.5);
         for direction in CompassQuadrant::ALL {
             if !should_draw_seam(grid, pos, *direction) {
                 continue;
@@ -125,10 +128,14 @@ fn draw_object_seams(
     grid: &Grid,
     gizmos: &mut Gizmos,
     bijection: &Bijection,
-    transform: &GlobalTransform,
+    transform: &Transform,
 ) {
     for pos in grid.iter_set_positions() {
-        let Some(center) = bijection.0.src_to_dst(pos).map(|point| point.as_vec2()) else {
+        let Some(center) = bijection
+            .0
+            .src_to_dst(pos)
+            .map(|point| point.as_vec2() + Vec2::splat(0.5))
+        else {
             continue;
         };
 
@@ -140,13 +147,14 @@ fn draw_object_seams(
             let neighbor = pos.wrapping_add_signed(direction.ivec2());
             let neighbor_dst = match bijection.0.src_to_dst(neighbor) {
                 Some(neighbor) => {
-                    let normal = (neighbor.as_vec2() - center).normalize_or_zero();
+                    let normal =
+                        (neighbor.as_vec2() + Vec2::splat(0.5) - center).normalize_or_zero();
                     (normal != Vec2::ZERO).then_some(normal)
                 }
                 None => None,
             }
             .unwrap_or_else(|| {
-                (transform.rotation() * direction.ivec2().as_vec2().extend(0.0)).truncate()
+                (transform.rotation * direction.ivec2().as_vec2().extend(0.0)).truncate()
             });
             let tangent = neighbor_dst.perp() * 0.5;
             let midpoint = center + neighbor_dst * 0.5;
@@ -164,16 +172,19 @@ mod tests {
     fn seam_checks_handle_outer_edges_and_disconnected_cells() {
         let mut grid = Grid::new(RuntimeShape::<u32, 2>::new([2, 2]));
         grid.set_brush(Vec2::ZERO, 1, Some(()));
-        assert!(should_draw_seam(&grid, UVec2::ZERO, CompassQuadrant::North));
-        assert!(should_draw_seam(&grid, UVec2::ZERO, CompassQuadrant::East));
-        for &direction in CompassQuadrant::ALL {
-            assert!(!should_draw_seam(&grid, UVec2::ONE, direction));
-        }
-        grid.set_edge(UVec2::ZERO, CompassQuadrant::North, false);
         assert!(!should_draw_seam(
             &grid,
             UVec2::ZERO,
             CompassQuadrant::North
         ));
+        assert!(!should_draw_seam(&grid, UVec2::ZERO, CompassQuadrant::East));
+        for &direction in CompassQuadrant::ALL {
+            assert_eq!(
+                should_draw_seam(&grid, UVec2::ONE, direction),
+                matches!(direction, CompassQuadrant::North | CompassQuadrant::East),
+            );
+        }
+        grid.set_edge(UVec2::ZERO, CompassQuadrant::North, false);
+        assert!(should_draw_seam(&grid, UVec2::Y, CompassQuadrant::South));
     }
 }
