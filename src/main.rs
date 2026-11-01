@@ -1,4 +1,4 @@
-use bevy::{math::CompassQuadrant, prelude::*};
+use bevy::{math::CompassQuadrant, prelude::*, transform::TransformSystems};
 use bevy_rapier3d::prelude::*;
 
 mod grid;
@@ -35,7 +35,11 @@ fn main() {
             Startup,
             (spawn_world_grid, spawn_edge_colliders, render_setup),
         )
-        .add_systems(Update, update_mouse_rigid_body)
+        // Apply edits and rebuild colliders before Rapier synchronizes in PostUpdate.
+        .add_systems(
+            Update,
+            (update_mouse_rigid_body, (edit, update_colliders).chain()),
+        )
         .add_systems(
             PostUpdate,
             move_mouse_rigid_body.before(PhysicsSet::SyncBackend),
@@ -49,14 +53,10 @@ fn main() {
         )
         .add_systems(
             PostUpdate,
-            (
-                recalculate_bijection,
-                edit,
-                update_colliders,
-                render_world,
-                draw_selection,
-            )
-                .chain(),
+            (recalculate_bijection, (render_world, draw_selection))
+                .chain()
+                .after(PhysicsSet::Writeback)
+                .after(TransformSystems::Propagate),
         )
         .run();
 }

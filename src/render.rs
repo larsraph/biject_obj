@@ -95,14 +95,14 @@ pub fn render_world(
 }
 
 fn should_draw_seam(grid: &Grid, pos: UVec2, direction: CompassQuadrant) -> bool {
-    if !matches!(direction, CompassQuadrant::North | CompassQuadrant::East) {
-        return false;
-    }
+    let primary_render = !matches!(direction, CompassQuadrant::North | CompassQuadrant::East);
     let neighbor = pos.wrapping_add_signed(direction.ivec2());
     let is_set = grid.contains(neighbor) && grid[neighbor].is_some();
+    if !primary_render && is_set {
+        return false;
+    }
     let is_connected = grid.get_edge(pos, direction);
-
-    is_set && is_connected
+    !is_connected
 }
 
 fn draw_grid_seams(grid: &Grid, gizmos: &mut Gizmos) {
