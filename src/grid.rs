@@ -416,7 +416,7 @@ pub fn handle_grid_collisions(
                 // Cached event pairs can disappear when colliders are removed.
                 continue;
             };
-            assert_eq!(contact_pair.collider1(), Some(*base));
+            let grid_first = contact_pair.collider1() == Some(*base);
 
             for manifold in contact_pair.manifolds() {
                 for point in manifold.points() {
@@ -425,8 +425,13 @@ pub fn handle_grid_collisions(
                         continue;
                     }
                     has_impulse = true;
-                    let impulse_world = manifold.normal() * impulse;
-                    let p = point.local_p1();
+                    let impulse_world =
+                        manifold.normal() * impulse * if grid_first { 1.0 } else { -1.0 };
+                    let p = if grid_first {
+                        point.local_p1()
+                    } else {
+                        point.local_p2()
+                    };
                     let point_world = transform.transform_point(p);
                     crate::simulation::add_impulse(
                         &grid,
