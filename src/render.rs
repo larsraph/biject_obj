@@ -1,8 +1,10 @@
 use bevy::{camera::ScalingMode, math::CompassQuadrant, prelude::*};
+use bevy_rapier3d::prelude::Collider;
 
 use crate::{
     All as _, ToIVec2 as _,
     grid::{Bijection, Grid, ObjGrid, SIZE, WorldGrid},
+    input::MouseFollower,
 };
 
 const PX_PER_CELL: u32 = 4;
@@ -94,6 +96,22 @@ pub fn render_world(
 
     for (e, _) in recycle {
         commands.entity(e).despawn();
+    }
+}
+
+/// Shows the actual physics body, including when collisions keep it off the cursor.
+pub fn render_mouse_follower(
+    followers: Query<(&Transform, &Collider), With<MouseFollower>>,
+    mut gizmos: Gizmos,
+) {
+    for (transform, collider) in &followers {
+        if let Some(ball) = collider.as_ball() {
+            gizmos.circle_2d(
+                Isometry2d::from_translation(transform.translation.truncate()),
+                ball.radius(),
+                Color::srgb(1.0, 0.2, 0.1),
+            );
+        }
     }
 }
 

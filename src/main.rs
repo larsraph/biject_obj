@@ -16,7 +16,7 @@ use crate::{
         Brush, MouseTarget, Selection, draw_selection, edit, move_mouse_rigid_body,
         update_mouse_rigid_body,
     },
-    render::{QuadTemplate, render_setup, render_world},
+    render::{QuadTemplate, render_mouse_follower, render_setup, render_world},
 };
 
 fn main() {
@@ -53,7 +53,10 @@ fn main() {
         )
         .add_systems(
             PostUpdate,
-            (recalculate_bijection, (render_world, draw_selection))
+            (
+                recalculate_bijection,
+                (render_world, draw_selection, render_mouse_follower),
+            )
                 .chain()
                 .after(PhysicsSet::Writeback)
                 .before(TransformSystems::Propagate),

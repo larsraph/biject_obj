@@ -72,6 +72,7 @@ pub fn update_mouse_rigid_body(
             Ccd::enabled(),
             Transform::from_translation(position),
             Velocity::zero(),
+            AdditionalMassProperties::Mass(2.),
             GravityScale(0.0),
             Sleeping::disabled(),
             LockedAxes::TRANSLATION_LOCKED_Z
@@ -169,6 +170,8 @@ pub fn edit(
                         objgrid,
                         collider,
                         RigidBody::Dynamic,
+                        // Track the previous step's motion for later fragmentation.
+                        Velocity::zero(),
                         LockedAxes::TRANSLATION_LOCKED_Z
                             | LockedAxes::ROTATION_LOCKED_X
                             | LockedAxes::ROTATION_LOCKED_Y,

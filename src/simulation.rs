@@ -5,7 +5,7 @@ use ndshape::Shape;
 
 use crate::{All as _, ToIVec2 as _, grid::Grid};
 
-const MAX_TRANSFER: f32 = 10.;
+const MAX_TRANSFER: f32 = 50.;
 
 #[derive(Default)]
 pub(crate) struct Scratch {

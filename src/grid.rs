@@ -1,4 +1,8 @@
-use bevy::{math::CompassQuadrant, platform::collections::HashSet, prelude::*};
+use bevy::{
+    math::CompassQuadrant,
+    platform::collections::{HashMap, HashSet},
+    prelude::*,
+};
 use bevy_rapier3d::prelude::*;
 use bitvec::{bitbox, boxed::BitBox};
 use ndshape::{RuntimeShape, Shape};
@@ -333,29 +337,49 @@ pub fn spawn_edge_colliders(mut commands: Commands) {
 
 #[derive(Resource, Default)]
 pub struct Collisions {
-    set: HashSet<(Entity, Entity)>,
+    map: HashMap<Entity, HashSet<Entity>>,
 }
 
 pub fn on_world_grid_collision(
     mut events: MessageReader<CollisionEvent>,
     mut collisions: ResMut<Collisions>,
+    query: Query<(), With<Grid>>,
 ) {
     for event in events.read() {
         match event {
             CollisionEvent::Started(a, b, _) => {
-                collisions.set.insert((*a, *b));
+                for (grid, other) in [(*a, *b), (*b, *a)] {
+                    if query.contains(grid) {
+                        collisions.map.entry(grid).or_default().insert(other);
+                    }
+                }
             }
             CollisionEvent::Stopped(a, b, _) => {
-                collisions.set.remove(&(*a, *b));
+                for (grid, other) in [(a, b), (b, a)] {
+                    if let Some(set) = collisions.map.get_mut(grid) {
+                        set.remove(other);
+                        if set.is_empty() {
+                            collisions.map.remove(grid);
+                        }
+                    }
+                }
             }
         }
     }
 }
 
+type CollisionGridData = (
+    &'static mut Grid,
+    &'static GlobalTransform,
+    &'static Collider,
+    Option<&'static WorldGrid>,
+    Option<&'static Velocity>,
+);
+
 pub fn handle_grid_collisions(
     mut commands: Commands,
     collisions: Res<Collisions>,
-    mut grids: Query<(&mut Grid, &GlobalTransform, Option<&WorldGrid>)>,
+    mut grids: Query<CollisionGridData>,
     rapier_context: ReadRapierContext,
     mut scratch: Local<crate::simulation::Scratch>,
 ) {
@@ -363,32 +387,46 @@ pub fn handle_grid_collisions(
         error!("Multiple contexts");
         return;
     };
-    for (a, b) in collisions.set.iter().copied() {
-        for grid_entity in [a, b] {
-            let Ok((mut grid, transform, anchors)) = grids.get_mut(grid_entity) else {
+    for (base, others) in collisions.map.iter() {
+        let Ok((mut grid, transform, parent_collider, anchors, parent_velocity)) =
+            grids.get_mut(*base)
+        else {
+            warn!("No grid for base entity: {:?}", base);
+            continue;
+        };
+        if grid.is_1x1() {
+            continue;
+        }
+
+        let local_from_world = transform.affine().inverse();
+        // This system runs before Writeback: ECS velocity is the parent's
+        // pre-step motion, so adding the cellular impulse does not count it twice.
+        let parent_velocity = parent_velocity.copied().unwrap_or_else(Velocity::zero);
+        let spinning = parent_velocity.angular != Vec3::ZERO;
+        let parent_center = if spinning {
+            parent_collider.raw.mass_properties(1.0).local_com
+        } else {
+            Vec3::ZERO
+        };
+
+        crate::simulation::initialize_scratch(&grid, &mut scratch);
+        let mut has_impulse = false;
+        for other in others {
+            let Some(contact_pair) = rapier_context.contact_pair(*base, *other) else {
+                // Cached event pairs can disappear when colliders are removed.
                 continue;
             };
-            let local_from_world = transform.affine().inverse();
+            assert_eq!(contact_pair.collider1(), Some(*base));
 
-            let Some(contact_pair) = rapier_context.contact_pair(a, b) else {
-                error!("Expected contact pair");
-                continue;
-            };
-            let grid_first = contact_pair.collider1() == Some(grid_entity);
-
-            if grid.is_1x1() {
-                continue;
-            }
-            crate::simulation::initialize_scratch(&grid, &mut scratch);
             for manifold in contact_pair.manifolds() {
                 for point in manifold.points() {
-                    let impulse_world =
-                        manifold.normal() * point.impulse() * if grid_first { 1. } else { -1. };
-                    let p = if grid_first {
-                        point.local_p1()
-                    } else {
-                        point.local_p2()
-                    };
+                    let impulse = point.impulse();
+                    if impulse == 0.0 {
+                        continue;
+                    }
+                    has_impulse = true;
+                    let impulse_world = manifold.normal() * impulse;
+                    let p = point.local_p1();
                     let point_world = transform.transform_point(p);
                     crate::simulation::add_impulse(
                         &grid,
@@ -398,38 +436,63 @@ pub fn handle_grid_collisions(
                     );
                 }
             }
-            let result = crate::simulation::solve(&mut grid, &mut scratch, 10, anchors.is_some());
-            for (grid, collider, velocity, offset) in result {
-                let object_transform = Transform {
-                    translation: transform.transform_point(offset),
-                    rotation: transform.rotation(),
-                    ..default()
-                };
-                let solution = projection::solve(
-                    &grid,
-                    object_transform.rotation,
-                    object_transform.translation.into(),
-                );
-                let rotation = object_transform.rotation;
-                let velocity = Velocity {
-                    linear: rotation * velocity.linear,
-                    angular: rotation * velocity.angular,
-                };
-                commands.spawn((
-                    grid,
-                    collider,
-                    velocity,
-                    object_transform,
-                    RigidBody::Dynamic,
-                    ObjGrid,
-                    LockedAxes::TRANSLATION_LOCKED_Z
-                        | LockedAxes::ROTATION_LOCKED_X
-                        | LockedAxes::ROTATION_LOCKED_Y,
-                    Bijection(solution),
-                    ActiveEvents::COLLISION_EVENTS,
-                ));
-            }
         }
+        if !has_impulse {
+            continue;
+        }
+        let result = crate::simulation::solve(&mut grid, &mut scratch, 10, anchors.is_some());
+        for (grid, collider, velocity, offset) in result {
+            let object_transform = Transform {
+                translation: transform.transform_point(offset),
+                rotation: transform.rotation(),
+                ..default()
+            };
+            let solution = projection::solve(
+                &grid,
+                object_transform.rotation,
+                object_transform.translation.into(),
+            );
+            let center_offset = if spinning {
+                let fragment_center = collider.raw.mass_properties(1.0).local_com;
+                transform
+                    .affine()
+                    .transform_vector3(offset + fragment_center - parent_center)
+            } else {
+                Vec3::ZERO
+            };
+            let velocity = inherit_fragment_velocity(
+                parent_velocity,
+                center_offset,
+                object_transform.rotation,
+                velocity,
+            );
+            commands.spawn((
+                grid,
+                collider,
+                velocity,
+                object_transform,
+                RigidBody::Dynamic,
+                ObjGrid,
+                LockedAxes::TRANSLATION_LOCKED_Z
+                    | LockedAxes::ROTATION_LOCKED_X
+                    | LockedAxes::ROTATION_LOCKED_Y,
+                Bijection(solution),
+                ActiveEvents::COLLISION_EVENTS,
+            ));
+        }
+    }
+}
+
+/// Adds the parent's world-space rigid motion to the fragment's local impulse response.
+fn inherit_fragment_velocity(
+    parent: Velocity,
+    center_offset: Vec3,
+    rotation: Quat,
+    relative: Velocity,
+) -> Velocity {
+    Velocity {
+        linear: parent.linear + parent.angular.cross(center_offset) + rotation * relative.linear,
+        angular: parent.angular + rotation * relative.angular,
     }
 }
 
@@ -606,5 +669,117 @@ mod tests {
                 .count(),
             1
         );
+    }
+    #[test]
+    fn fragments_inherit_translation_and_spin_at_their_centers() {
+        let parent = Velocity {
+            linear: Vec3::new(3.0, 4.0, 0.0),
+            angular: Vec3::Z * 2.0,
+        };
+        let parent_collider = Collider::voxels(Vec3::ONE, &[IVec3::ZERO, IVec3::X]);
+        let fragment_collider = Collider::voxels(Vec3::ONE, &[IVec3::ZERO]);
+        let parent_center = parent_collider.raw.mass_properties(1.0).local_com;
+        let fragment_center = fragment_collider.raw.mass_properties(1.0).local_com;
+        let left = inherit_fragment_velocity(
+            parent,
+            fragment_center - parent_center,
+            Quat::IDENTITY,
+            Velocity::zero(),
+        );
+        let right = inherit_fragment_velocity(
+            parent,
+            Vec3::X + fragment_center - parent_center,
+            Quat::IDENTITY,
+            Velocity::zero(),
+        );
+        assert_eq!(left.linear, Vec3::new(3.0, 3.0, 0.0));
+        assert_eq!(right.linear, Vec3::new(3.0, 5.0, 0.0));
+        assert_eq!(left.angular, parent.angular);
+        assert_eq!(right.angular, parent.angular);
+        assert_eq!((left.linear + right.linear) * 0.5, parent.linear);
+        let angular_momentum = (fragment_center - parent_center).cross(left.linear - parent.linear)
+            + (Vec3::X + fragment_center - parent_center).cross(right.linear - parent.linear)
+            + (left.angular + right.angular) / 6.0;
+        assert!((angular_momentum.z - (5.0 / 6.0) * parent.angular.z).abs() < 1e-6);
+    }
+
+    #[test]
+    fn inherited_motion_and_local_impulse_use_their_correct_frames() {
+        let rotation = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let parent = Velocity {
+            linear: Vec3::X * 3.0,
+            angular: Vec3::Z * 2.0,
+        };
+        let relative = Velocity {
+            linear: Vec3::X * 4.0,
+            angular: Vec3::Z * 0.5,
+        };
+        let result = inherit_fragment_velocity(parent, rotation * Vec3::X, rotation, relative);
+        assert!((result.linear - Vec3::new(1.0, 4.0, 0.0)).length() < 1e-6);
+        assert_eq!(result.angular, Vec3::Z * 2.5);
+        let stationary = inherit_fragment_velocity(Velocity::zero(), Vec3::ONE, rotation, relative);
+        assert!((stationary.linear - Vec3::Y * 4.0).length() < 1e-6);
+        assert!((stationary.angular - relative.angular).length() < 1e-6);
+    }
+    fn collision_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_message::<CollisionEvent>()
+            .init_resource::<Collisions>()
+            .add_systems(Update, on_world_grid_collision);
+        app
+    }
+
+    #[test]
+    fn collision_map_groups_other_colliders_and_removes_only_stopped_pairs() {
+        use bevy_rapier3d::rapier::geometry::CollisionEventFlags;
+        let mut app = collision_app();
+        let a = app.world_mut().spawn(grid([2, 2])).id();
+        let b = app.world_mut().spawn(grid([2, 2])).id();
+        let wall = app.world_mut().spawn_empty().id();
+        let unrelated = app.world_mut().spawn_empty().id();
+        for (first, second) in [(a, b), (b, a), (wall, a), (wall, unrelated)] {
+            app.world_mut().write_message(CollisionEvent::Started(
+                first,
+                second,
+                CollisionEventFlags::empty(),
+            ));
+        }
+        app.update();
+        let collisions = app.world().resource::<Collisions>();
+        assert_eq!(collisions.map.len(), 2);
+        assert_eq!(collisions.map[&a], HashSet::from_iter([b, wall]));
+        assert_eq!(collisions.map[&b], HashSet::from_iter([a]));
+        assert!(!collisions.map[&a].contains(&a));
+
+        app.world_mut()
+            .write_message(CollisionEvent::Stopped(b, a, CollisionEventFlags::empty()));
+        app.update();
+        let collisions = app.world().resource::<Collisions>();
+        assert_eq!(collisions.map[&a], HashSet::from_iter([wall]));
+        assert!(!collisions.map.contains_key(&b));
+        app.world_mut().write_message(CollisionEvent::Stopped(
+            a,
+            wall,
+            CollisionEventFlags::empty(),
+        ));
+        app.update();
+        assert!(app.world().resource::<Collisions>().map.is_empty());
+    }
+
+    #[test]
+    fn stopped_collision_cleans_up_despawned_grid() {
+        use bevy_rapier3d::rapier::geometry::CollisionEventFlags;
+        let mut app = collision_app();
+        let a = app.world_mut().spawn(grid([2, 2])).id();
+        let b = app.world_mut().spawn(grid([2, 2])).id();
+        app.world_mut()
+            .write_message(CollisionEvent::Started(a, b, CollisionEventFlags::empty()));
+        app.update();
+        app.world_mut().despawn(a);
+        app.world_mut()
+            .write_message(CollisionEvent::Stopped(a, b, CollisionEventFlags::empty()));
+        app.update();
+        assert!(app.world().resource::<Collisions>().map.is_empty());
     }
 }
