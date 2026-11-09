@@ -369,6 +369,7 @@ pub fn on_world_grid_collision(
 }
 
 type CollisionGridData = (
+    Entity,
     &'static mut Grid,
     &'static GlobalTransform,
     &'static Collider,
@@ -378,45 +379,29 @@ type CollisionGridData = (
 
 pub fn handle_grid_collisions(
     mut commands: Commands,
-    collisions: Res<Collisions>,
     mut grids: Query<CollisionGridData>,
-    rapier_context: ReadRapierContext,
+    rapier: ReadRapierContext,
     mut scratch: Local<crate::simulation::Scratch>,
 ) {
-    let Ok(rapier_context) = rapier_context.single() else {
+    let Ok(rapier) = rapier.single() else {
         error!("Multiple contexts");
         return;
     };
-    for (base, others) in collisions.map.iter() {
-        let Ok((mut grid, transform, parent_collider, anchors, parent_velocity)) =
-            grids.get_mut(*base)
-        else {
-            warn!("No grid for base entity: {:?}", base);
-            continue;
-        };
+
+    for (entity, mut grid, transform, collider, anchors, velocity) in grids.iter_mut() {
         if grid.is_1x1() {
             continue;
         }
 
         let local_from_world = transform.affine().inverse();
-        // This system runs before Writeback: ECS velocity is the parent's
-        // pre-step motion, so adding the cellular impulse does not count it twice.
-        let parent_velocity = parent_velocity.copied().unwrap_or_else(Velocity::zero);
-        let spinning = parent_velocity.angular != Vec3::ZERO;
-        let parent_center = if spinning {
-            parent_collider.raw.mass_properties(1.0).local_com
-        } else {
-            Vec3::ZERO
-        };
+        let parent_velocity = velocity.copied().unwrap_or_else(Velocity::zero);
+        let com = (parent_velocity.angular != Vec3::ZERO)
+            .then(|| collider.raw.mass_properties(1.0).local_com);
 
         crate::simulation::initialize_scratch(grid.shape.usize(), &mut scratch);
         let mut has_impulse = false;
-        for other in others {
-            let Some(contact_pair) = rapier_context.contact_pair(*base, *other) else {
-                // Cached event pairs can disappear when colliders are removed.
-                continue;
-            };
-            let grid_first = contact_pair.collider1() == Some(*base);
+        for contact_pair in rapier.contact_pairs_with(entity) {
+            let grid_first = contact_pair.collider1() == Some(entity);
 
             for manifold in contact_pair.manifolds() {
                 for point in manifold.points() {
@@ -425,19 +410,19 @@ pub fn handle_grid_collisions(
                         continue;
                     }
                     has_impulse = true;
-                    let impulse_world =
-                        manifold.normal() * impulse * if grid_first { 1.0 } else { -1.0 };
-                    let p = if grid_first {
+                    let local_normal = local_from_world.transform_vector3(manifold.normal());
+                    let local_impulse =
+                        local_normal * impulse * if grid_first { 1.0 } else { -1.0 };
+                    let local_point = if grid_first {
                         point.local_p1()
                     } else {
                         point.local_p2()
                     };
-                    let point_world = transform.transform_point(p);
                     crate::simulation::add_impulse(
                         &grid,
                         &mut scratch,
-                        local_from_world.transform_vector3(impulse_world).truncate(),
-                        local_from_world.transform_point3(point_world).truncate(),
+                        local_impulse.truncate(),
+                        local_point.truncate(),
                     );
                 }
             }
@@ -457,7 +442,7 @@ pub fn handle_grid_collisions(
                 object_transform.rotation,
                 object_transform.translation.into(),
             );
-            let center_offset = if spinning {
+            let center_offset = if let Some(parent_center) = com {
                 let fragment_center = collider.raw.mass_properties(1.0).local_com;
                 transform
                     .affine()
