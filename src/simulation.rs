@@ -124,21 +124,25 @@ fn equalize_velocity(iterations: usize, grid: &Grid, scratch: &mut Scratch) {
     for _ in 0..iterations {
         // for every constraint try to equalize the velocities
         let [x_range, y_range] = grid.shape.as_array();
-        for y in 0..y_range {
-            for x in 0..x_range {
-                let pos = UVec2::new(x, y);
-                if grid[pos].is_none() {
+        for direction in [CompassQuadrant::North, CompassQuadrant::East] {
+            let is_y = direction == CompassQuadrant::North;
+            for y in 0..y_range {
+                if is_y && y == y_range - 1 {
                     continue;
                 }
-                for is_y in [true, false] {
-                    // skip the faces facing into the boundary
-                    if is_y && y == y_range - 1 || !is_y && x == x_range - 1 {
+                for x in 0..x_range {
+                    if !is_y && x == x_range - 1 {
                         continue;
                     }
 
-                    let step = if is_y { IVec2::Y } else { IVec2::X };
+                    let pos = UVec2::new(x, y);
+                    if grid[pos].is_none() {
+                        continue;
+                    }
+
                     let a = pos;
-                    let b = pos.wrapping_add_signed(step);
+                    // guaranteed in bounds by the checks above
+                    let b = pos.wrapping_add_signed(direction.ivec2());
 
                     if grid[b].is_none() {
                         continue;
@@ -150,20 +154,16 @@ fn equalize_velocity(iterations: usize, grid: &Grid, scratch: &mut Scratch) {
                     let vel_a = scratch.cell_velocity[a_idx];
                     let vel_b = scratch.cell_velocity[b_idx];
 
-                    let quadrant = if is_y {
-                        CompassQuadrant::North
-                    } else {
-                        CompassQuadrant::East
-                    };
+                    let aligned =
+                        aligned(vel_a, vel_b, matches!(direction, CompassQuadrant::North));
 
-                    let dot = vel_a.dot(vel_b);
-                    if dot > 0. {
-                        // completely sticky/rigid collision
+                    // completely sticky/rigid collision
+                    if aligned {
                         let half_diff = (vel_a - vel_b) / 2.;
                         scratch.cell_velocity[a_idx] -= half_diff;
                         scratch.cell_velocity[b_idx] += half_diff;
                         scratch.face[a_idx][is_y as usize] += half_diff;
-                    } else if grid.get_edge(pos, quadrant) {
+                    } else if grid.get_edge(pos, direction) {
                         // pulled apart has a cap and requires connection
                         let transferred = &mut scratch.face[a_idx][is_y as usize];
 
@@ -273,6 +273,14 @@ fn extract_blobs(
             }
         }
     }
+}
+
+fn aligned(vel_a: Vec2, vel_b: Vec2, is_y: bool) -> bool {
+    let vec = match is_y {
+        true => Vec2::Y,
+        false => Vec2::X,
+    };
+    (vel_b - vel_a).dot(vec) > 0.0
 }
 
 // find c_max such that ||a + cb|| <= d
