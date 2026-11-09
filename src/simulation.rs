@@ -8,7 +8,7 @@ use crate::{
     grid::{Bijection, Grid, ObjGrid, inherit_fragment_velocity},
 };
 
-const MAX_TRANSFER: f32 = 30.;
+const MAX_TRANSFER: f32 = 10.;
 
 #[derive(Default)]
 pub(crate) struct Scratch {
