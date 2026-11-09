@@ -16,7 +16,10 @@ use crate::{
         Brush, MouseTarget, Selection, draw_selection, edit, move_mouse_rigid_body,
         update_mouse_rigid_body,
     },
-    render::{QuadTemplate, render_mouse_follower, render_setup, render_world},
+    render::{
+        QuadTemplate, render_mouse_follower, render_setup, render_world, setup_grid_counter,
+        update_grid_counter,
+    },
 };
 
 fn main() {
@@ -33,7 +36,12 @@ fn main() {
         .init_resource::<Collisions>()
         .add_systems(
             Startup,
-            (spawn_world_grid, spawn_edge_colliders, render_setup),
+            (
+                spawn_world_grid,
+                spawn_edge_colliders,
+                render_setup,
+                setup_grid_counter,
+            ),
         )
         // Apply edits and rebuild colliders before Rapier synchronizes in PostUpdate.
         .add_systems(
@@ -56,7 +64,12 @@ fn main() {
             (
                 recalculate_bijection,
                 repossess_sleeping,
-                (render_world, draw_selection, render_mouse_follower),
+                (
+                    render_world,
+                    draw_selection,
+                    render_mouse_follower,
+                    update_grid_counter,
+                ),
             )
                 .chain()
                 .after(PhysicsSet::Writeback)

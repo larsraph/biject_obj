@@ -1,5 +1,5 @@
 use bevy::{camera::ScalingMode, math::CompassQuadrant, prelude::*};
-use bevy_rapier3d::prelude::Collider;
+use bevy_rapier3d::prelude::{Collider, RigidBody};
 
 use crate::{
     All as _, ToIVec2 as _,
@@ -55,6 +55,43 @@ pub fn render_setup(mut commands: Commands) {
         }),
         Transform::from_xyz(SIZE as f32 / 2.0, SIZE as f32 / 2.0, 0.0),
     ));
+}
+
+#[derive(Component)]
+pub struct DynamicGridCount;
+
+pub fn setup_grid_counter(mut commands: Commands) {
+    commands.spawn((
+        DynamicGridCount,
+        Text::new("Dynamic grids: 0"),
+        TextFont {
+            font_size: bevy::text::FontSize::Px(20.0),
+            ..default()
+        },
+        TextColor(Color::BLACK),
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(12.0),
+            top: px(12.0),
+            ..default()
+        },
+    ));
+}
+
+pub fn update_grid_counter(
+    grids: Query<&RigidBody, With<Grid>>,
+    mut labels: Query<&mut Text, With<DynamicGridCount>>,
+) {
+    let count = grids
+        .iter()
+        .filter(|body| **body == RigidBody::Dynamic)
+        .count();
+    let label = format!("Dynamic grids: {count}");
+    for mut text in &mut labels {
+        if text.0 != label {
+            text.0.clone_from(&label);
+        }
+    }
 }
 
 pub fn render_world(
