@@ -468,6 +468,7 @@ pub fn handle_grid_collisions(
                     | LockedAxes::ROTATION_LOCKED_Y,
                 Bijection(solution),
                 ActiveEvents::COLLISION_EVENTS,
+                Sleeping::default(),
             ));
         }
     }
