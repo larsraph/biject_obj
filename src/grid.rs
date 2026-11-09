@@ -421,11 +421,13 @@ pub fn handle_grid_collisions(
                     has_impulse = true;
                     let world_impulse = contact_impulse(manifold.normal(), impulse, grid_first);
                     let local_impulse = local_from_world.transform_vector3(world_impulse);
-                    let local_point = if grid_first {
-                        point.local_p1()
-                    } else {
-                        point.local_p2()
-                    };
+                    let local_point = contact_point_in_grid(
+                        &grid,
+                        manifold.raw,
+                        point.raw,
+                        grid_first,
+                        local_impulse.normalize_or_zero(),
+                    );
                     crate::simulation::add_impulse(
                         &grid,
                         &mut scratch,
@@ -452,6 +454,37 @@ pub fn handle_grid_collisions(
             },
         );
     }
+}
+
+fn contact_point_in_grid(
+    grid: &Grid,
+    manifold: &bevy_rapier3d::rapier::geometry::ContactManifold,
+    point: &bevy_rapier3d::rapier::geometry::Contact,
+    grid_first: bool,
+    inward: Vec3,
+) -> Vec3 {
+    let (point, subshape) = if grid_first {
+        (point.local_p1, manifold.subshape_pos1)
+    } else {
+        (point.local_p2, manifold.subshape_pos2)
+    };
+    let point = subshape.map_or(point, |pose| pose.transform_point(point));
+    // A point exactly on an east/north voxel face floors to its empty neighbor.
+    // Sample inside the contacted voxel instead, independent of collider order.
+    let point = point + inward * 1e-3;
+    // Box contacts can also lie exactly on a voxel corner. Prefer the occupied
+    // cell on the inward side, checking the adjoining tangent cells as well.
+    for offset in [Vec3::ZERO, -Vec3::X, -Vec3::Y, -Vec3::X - Vec3::Y] {
+        let candidate = point + offset * 1e-3;
+        let cell = candidate.truncate().floor().as_ivec2();
+        if cell.cmpge(IVec2::ZERO).all()
+            && grid.linearize_checked(cell.as_uvec2()).is_some()
+            && grid[cell.as_uvec2()].is_some()
+        {
+            return candidate;
+        }
+    }
+    point
 }
 
 // Rapier's normal points from collider 1 toward collider 2. The contact
@@ -567,6 +600,87 @@ mod tests {
         app.update();
         assert!(app.world().get::<Collider>(entity).is_some());
         assert_eq!(app.world().resource::<ColliderChanges>().0, 3);
+    }
+
+    #[test]
+    fn contacts_on_every_voxel_face_sample_the_occupied_world_cell() {
+        use bevy_rapier3d::rapier::prelude as rp;
+
+        let cell = IVec3::new(3, 4, 0);
+        let mut grid = grid([8, 8]);
+        grid.paint_cell(cell.truncate().as_uvec2(), Some(()));
+        for outward in [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y] {
+            for grid_inserted_first in [false, true] {
+                for ball in [false, true] {
+                    let mut bodies = rp::RigidBodySet::new();
+                    let mut colliders = rp::ColliderSet::new();
+                    let center = cell.as_vec3() + Vec3::splat(0.5) + outward * 0.99;
+                    let body = bodies.insert(
+                        rp::RigidBodyBuilder::dynamic()
+                            .translation(center)
+                            .linvel(-outward * 10.0)
+                            .build(),
+                    );
+                    let mut handles = Vec::new();
+                    for is_grid in [grid_inserted_first, !grid_inserted_first] {
+                        let handle = if is_grid {
+                            colliders.insert(
+                                rp::ColliderBuilder::new(Collider::voxels(Vec3::ONE, &[cell]).raw)
+                                    .build(),
+                            )
+                        } else {
+                            let builder = if ball {
+                                rp::ColliderBuilder::ball(0.5)
+                            } else {
+                                rp::ColliderBuilder::cuboid(0.5, 0.5, 0.5)
+                            };
+                            colliders.insert_with_parent(
+                                builder.friction(0.0).build(),
+                                body,
+                                &mut bodies,
+                            )
+                        };
+                        handles.push(handle);
+                    }
+                    let grid_handle = handles[usize::from(!grid_inserted_first)];
+                    let mut narrow_phase = rp::NarrowPhase::new();
+                    rp::PhysicsPipeline::new().step(
+                        Vec3::ZERO,
+                        &rp::IntegrationParameters::default(),
+                        &mut rp::IslandManager::new(),
+                        &mut rp::BroadPhaseBvh::new(),
+                        &mut narrow_phase,
+                        &mut bodies,
+                        &mut colliders,
+                        &mut rp::ImpulseJointSet::new(),
+                        &mut rp::MultibodyJointSet::new(),
+                        &mut rp::CCDSolver::new(),
+                        &(),
+                        &(),
+                    );
+                    let pair = narrow_phase.contact_pair(handles[0], handles[1]).unwrap();
+                    let grid_first = pair.collider1 == grid_handle;
+                    let mut loaded_contacts = 0;
+                    for manifold in &pair.manifolds {
+                        for point in &manifold.points {
+                            if point.data.impulse == 0.0 {
+                                continue;
+                            }
+                            let inward = contact_impulse(manifold.data.normal, 1.0, grid_first);
+                            let pos =
+                                contact_point_in_grid(&grid, manifold, point, grid_first, inward);
+                            assert_eq!(
+                                pos.truncate().floor().as_ivec2(),
+                                cell.truncate(),
+                                "side {outward:?}, ball {ball}, grid first {grid_first}, point {pos:?}"
+                            );
+                            loaded_contacts += 1;
+                        }
+                    }
+                    assert!(loaded_contacts > 0);
+                }
+            }
+        }
     }
 
     #[test]
