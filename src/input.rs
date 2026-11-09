@@ -170,6 +170,7 @@ pub fn edit(
                         objgrid,
                         collider,
                         RigidBody::Dynamic,
+                        Sleeping::default(),
                         // Track the previous step's motion for later fragmentation.
                         Velocity::zero(),
                         LockedAxes::TRANSLATION_LOCKED_Z
