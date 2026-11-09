@@ -3,7 +3,10 @@ use bevy_rapier3d::prelude::*;
 use bitvec::vec::BitVec;
 use ndshape::{RuntimeShape, Shape};
 
-use crate::{All as _, ToIVec2 as _, grid::Grid};
+use crate::{
+    All as _, ToIVec2 as _,
+    grid::{Bijection, Grid, ObjGrid, inherit_fragment_velocity},
+};
 
 const MAX_TRANSFER: f32 = 30.;
 
@@ -41,22 +44,35 @@ pub(crate) fn add_impulse(grid: &Grid, scratch: &mut Scratch, impulse: Vec2, pos
     scratch.cell_velocity[idx] += impulse;
 }
 
+pub(crate) struct ParentBody {
+    pub entity: Entity,
+    pub transform: GlobalTransform,
+    pub velocity: Velocity,
+    pub center: Option<Vec3>,
+    pub anchors_boundary: bool,
+}
+
+struct Blob {
+    positions: Vec<IVec3>,
+    min: IVec2,
+    max: IVec2,
+    touches_boundary: bool,
+}
+
 // TODO: Re-extract unsupported components after editing.
 pub(crate) fn solve(
+    commands: &mut Commands,
     grid: &mut Grid,
     scratch: &mut Scratch,
     iterations: usize,
-    anchors_boundary: bool,
-) -> impl Iterator<Item = (Grid, Collider, Velocity, Vec3)> {
+    parent: &ParentBody,
+) {
     relax(iterations, grid, scratch);
-    break_bonds(scratch, grid);
-    let mut blobs = Vec::new();
-    extract_blobs(grid, scratch, anchors_boundary, &mut blobs);
-
-    let source_shape = grid.shape;
-    blobs.into_iter().map(move |(cells, origin, blob_grid)| {
-        build_blob(cells, origin, blob_grid, source_shape, scratch)
-    })
+    if break_bonds(scratch, grid) {
+        let mut blobs = Vec::new();
+        find_blobs(grid, scratch, &mut blobs, parent.anchors_boundary);
+        extract_blobs_to_one(commands, parent, blobs, scratch, grid);
+    }
 }
 
 // Accumulate angular and linear momentum in each blob's local frame.
@@ -184,7 +200,8 @@ fn relax(iterations: usize, grid: &Grid, scratch: &mut Scratch) {
     }
 }
 
-fn break_bonds(scratch: &mut Scratch, grid: &mut Grid) {
+fn break_bonds(scratch: &mut Scratch, grid: &mut Grid) -> bool {
+    let mut any = false;
     // Break bonds whose accumulated transfer reaches the limit AND
     // that are not aligned.
     let [range_x, range_y] = grid.shape.as_array();
@@ -210,37 +227,34 @@ fn break_bonds(scratch: &mut Scratch, grid: &mut Grid) {
                     && !aligned(cell, other_cell, direction == CompassQuadrant::North)
                 {
                     grid.set_edge(pos, direction, false);
+                    any |= true;
                 }
             }
         }
     }
+    any
 }
 
-fn extract_blobs(
-    grid: &mut Grid,
-    scratch: &mut Scratch,
-    anchors_boundary: bool,
-    blobs: &mut Vec<(Vec<IVec3>, UVec2, Grid)>,
-) {
+fn find_blobs(grid: &Grid, scratch: &mut Scratch, blobs: &mut Vec<Blob>, anchors_boundary: bool) {
     let [x_size, y_size] = grid.shape.as_array();
     let size = UVec2::new(x_size, y_size);
     for y in 0..y_size {
         for x in 0..x_size {
             let pos = UVec2::new(x, y);
             let idx = grid.shape.linearize(pos) as usize;
-            if !scratch.cell_visited[idx]
-                && grid[pos].is_some()
-                && scratch.cell_velocity[idx]
-                    .abs()
-                    .cmpge(Vec2::splat(1e-5))
-                    .any()
-            {
+            if !scratch.cell_visited[idx] && grid[pos].is_some() {
+                let mut min = IVec2::MAX;
+                let mut max = IVec2::MIN;
                 let mut positions = Vec::new();
                 let mut pending = vec![pos];
                 scratch.cell_visited.set(idx, true);
                 let mut touches_boundary = false;
                 while let Some(cell) = pending.pop() {
-                    positions.push(cell.as_ivec2().extend(0));
+                    let pos_2 = cell.as_ivec2();
+                    min = min.min(pos_2);
+                    max = max.max(pos_2);
+                    positions.push(pos_2.extend(0));
+
                     touches_boundary |= anchors_boundary && is_boundary(cell, size);
                     for &dir in CompassQuadrant::ALL {
                         let target = cell.wrapping_add_signed(dir.ivec2());
@@ -255,42 +269,125 @@ fn extract_blobs(
                     }
                 }
 
-                if !touches_boundary {
-                    let mut blob_grid = Grid::new(grid.shape);
+                blobs.push(Blob {
+                    positions,
+                    min,
+                    max,
+                    touches_boundary,
+                });
+            }
+        }
+    }
+}
 
-                    for cell in &positions {
-                        let pos = cell.truncate().as_uvec2();
-                        blob_grid[pos] = grid[pos];
-                    }
+fn extract_blobs_to_one(
+    commands: &mut Commands,
+    parent: &ParentBody,
+    blobs: Vec<Blob>,
+    scratch: &Scratch,
+    grid: &mut Grid,
+) {
+    // Static terrain retains every anchored component. A dynamic body keeps
+    // its largest component, preserving the original entity and physics pose.
+    let retained = if parent.anchors_boundary {
+        None
+    } else {
+        blobs
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, blob)| blob.positions.len())
+            .map(|(index, _)| index)
+    };
+    let source_shape = grid.shape;
+    let mut extracted = false;
+    for (index, blob) in blobs.into_iter().enumerate() {
+        if blob.touches_boundary || Some(index) == retained {
+            continue;
+        }
+        let Blob {
+            mut positions,
+            min,
+            max,
+            ..
+        } = blob;
+        let origin = min.as_uvec2();
+        let size = (max - min + 1).as_uvec2();
+        let mut blob_grid = Grid::new(RuntimeShape::<u32, 2>::new(size));
 
-                    for cell in &positions {
-                        let pos = cell.truncate().as_uvec2();
-                        for &dir in CompassQuadrant::ALL {
-                            let neighbor = pos.wrapping_add_signed(dir.ivec2());
-                            if blob_grid.contains(neighbor)
-                                && blob_grid[neighbor].is_some()
-                                && grid.get_edge(pos, dir)
-                            {
-                                blob_grid.set_edge(pos, dir, true);
-                            }
-                        }
-                    }
-                    for cell in &mut positions {
-                        let pos = cell.truncate().as_uvec2();
-                        grid.paint_cell(pos, None);
-                    }
-                    let Some((origin, blob_grid)) = blob_grid.shrink_to_fit() else {
-                        error!("How did it shrink to nothing? {:?}", positions);
-                        continue;
-                    };
-
-                    // TODO: see if this can be lazy
-                    for cell in &mut positions {
-                        *cell = cell.wrapping_sub_unsigned(origin.extend(0));
-                    }
-                    blobs.push((positions, origin, blob_grid));
+        // Copy occupancy, then bonds, before clearing anything in the source.
+        for cell in &positions {
+            let pos = cell.truncate().as_uvec2();
+            blob_grid[pos - origin] = grid[pos];
+        }
+        for cell in &positions {
+            let pos = cell.truncate().as_uvec2();
+            let local_pos = pos - origin;
+            for dir in [CompassQuadrant::East, CompassQuadrant::North] {
+                let neighbor = local_pos.wrapping_add_signed(dir.ivec2());
+                if blob_grid.contains(neighbor)
+                    && blob_grid[neighbor].is_some()
+                    && grid.get_edge(pos, dir)
+                {
+                    blob_grid.set_edge(local_pos, dir, true);
                 }
             }
+        }
+        for cell in &positions {
+            grid.paint_cell(cell.truncate().as_uvec2(), None);
+        }
+        for cell in &mut positions {
+            *cell -= min.extend(0);
+        }
+        let (grid, collider, relative_velocity, offset) =
+            build_blob(positions, origin, blob_grid, source_shape, scratch);
+        let object_transform = Transform {
+            translation: parent.transform.transform_point(offset),
+            rotation: parent.transform.rotation(),
+            ..default()
+        };
+        let solution = crate::projection::solve(
+            &grid,
+            object_transform.rotation,
+            object_transform.translation.into(),
+        );
+        let center_offset = parent.center.map_or(Vec3::ZERO, |parent_center| {
+            let fragment_center = collider.raw.mass_properties(1.0).local_com;
+            parent
+                .transform
+                .affine()
+                .transform_vector3(offset + fragment_center - parent_center)
+        });
+        let velocity = inherit_fragment_velocity(
+            parent.velocity,
+            center_offset,
+            object_transform.rotation,
+            relative_velocity,
+        );
+        commands.spawn((
+            grid,
+            collider,
+            velocity,
+            object_transform,
+            RigidBody::Dynamic,
+            ObjGrid,
+            LockedAxes::TRANSLATION_LOCKED_Z
+                | LockedAxes::ROTATION_LOCKED_X
+                | LockedAxes::ROTATION_LOCKED_Y,
+            Bijection(solution),
+            ActiveEvents::COLLISION_EVENTS,
+            Sleeping::default(),
+        ));
+        extracted = true;
+    }
+    if extracted {
+        // The retained body keeps its pose and Rapier's collision response.
+        // Only its occupied geometry needs rebuilding before the next step.
+        if let Some(collider) = grid.build_collider() {
+            commands.entity(parent.entity).insert(collider);
+        } else if !parent.anchors_boundary {
+            commands.entity(parent.entity).despawn();
+        } else {
+            commands.entity(parent.entity).remove::<Collider>();
         }
     }
 }
@@ -328,8 +425,36 @@ mod tests {
     use super::*;
     use ndshape::RuntimeShape;
 
+    fn extract_for_test(
+        grid: &mut Grid,
+        scratch: &mut Scratch,
+        anchors_boundary: bool,
+    ) -> (World, Entity) {
+        let mut world = World::new();
+        let entity = world.spawn_empty().id();
+        let parent = ParentBody {
+            entity,
+            transform: GlobalTransform::IDENTITY,
+            velocity: Velocity::zero(),
+            center: None,
+            anchors_boundary,
+        };
+        let mut blobs = Vec::new();
+        find_blobs(grid, scratch, &mut blobs, anchors_boundary);
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        extract_blobs_to_one(
+            &mut Commands::new(&mut queue, &world),
+            &parent,
+            blobs,
+            scratch,
+            grid,
+        );
+        queue.apply(&mut world);
+        (world, entity)
+    }
+
     #[test]
-    fn detached_blob_retains_velocity_after_cropping() {
+    fn detached_blob_retains_velocity_and_bonds_after_cropping() {
         let mut grid = Grid::new(RuntimeShape::<u32, 2>::new([8, 8]));
         for pos in [UVec2::new(3, 4), UVec2::new(4, 4)] {
             grid.paint_cell(pos, Some(()));
@@ -338,13 +463,17 @@ mod tests {
         initialize_scratch(grid.shape.usize(), &mut scratch);
         add_impulse(&grid, &mut scratch, Vec2::Y, Vec2::new(3.0, 4.0));
         add_impulse(&grid, &mut scratch, Vec2::Y, Vec2::new(4.0, 4.0));
-        let blobs: Vec<_> = solve(&mut grid, &mut scratch, 0, true).collect();
-        assert_eq!(blobs.len(), 1);
-        let (blob, _, velocity, origin) = &blobs[0];
+        let (mut world, _) = extract_for_test(&mut grid, &mut scratch, true);
+        let (blob, velocity, transform, sleeping) = world
+            .query_filtered::<(&Grid, &Velocity, &Transform, &Sleeping), With<ObjGrid>>()
+            .single(&world)
+            .unwrap();
         assert_eq!(blob.size(), UVec2::new(2, 1));
-        assert_eq!(*origin, Vec3::new(3.0, 4.0, 0.0));
+        assert!(blob.get_edge(UVec2::ZERO, CompassQuadrant::East));
+        assert_eq!(transform.translation, Vec3::new(3.0, 4.0, 0.0));
         assert_eq!(velocity.linear, Vec3::Y);
         assert_eq!(velocity.angular, Vec3::ZERO);
+        assert!(!sleeping.sleeping);
         assert_eq!(grid.iter_set_positions().count(), 0);
     }
 
@@ -361,7 +490,14 @@ mod tests {
             let mut scratch = Scratch::default();
             initialize_scratch(grid.shape.usize(), &mut scratch);
             add_impulse(&grid, &mut scratch, Vec2::Y, pos.as_vec2());
-            assert_eq!(solve(&mut grid, &mut scratch, 0, true).count(), 0);
+            let (mut world, _) = extract_for_test(&mut grid, &mut scratch, true);
+            assert_eq!(
+                world
+                    .query_filtered::<Entity, With<ObjGrid>>()
+                    .iter(&world)
+                    .count(),
+                0
+            );
             assert!(grid[pos].is_some());
         }
     }
@@ -373,8 +509,71 @@ mod tests {
         let mut scratch = Scratch::default();
         initialize_scratch(grid.shape.usize(), &mut scratch);
         add_impulse(&grid, &mut scratch, Vec2::Y, Vec2::ZERO);
-        assert_eq!(solve(&mut grid, &mut scratch, 0, true).count(), 0);
+        let (mut world, _) = extract_for_test(&mut grid, &mut scratch, true);
+        assert_eq!(
+            world
+                .query_filtered::<Entity, With<ObjGrid>>()
+                .iter(&world)
+                .count(),
+            0
+        );
         assert!(scratch.cell_visited.all());
+    }
+
+    #[test]
+    fn dynamic_body_retains_largest_component_including_unloaded_cells() {
+        let mut grid = Grid::new(RuntimeShape::<u32, 2>::new([5, 1]));
+        for x in [0, 1, 4] {
+            grid.paint_cell(UVec2::new(x, 0), Some(()));
+        }
+        let mut scratch = Scratch::default();
+        initialize_scratch(grid.shape.usize(), &mut scratch);
+        let (mut world, original) = extract_for_test(&mut grid, &mut scratch, false);
+        assert!(world.get_entity(original).is_ok());
+        assert!(world.get::<Collider>(original).is_some());
+        assert_eq!(grid.iter_set_positions().count(), 2);
+        assert!(grid.get_edge(UVec2::ZERO, CompassQuadrant::East));
+        let (fragment, transform) = world
+            .query_filtered::<(&Grid, &Transform), With<ObjGrid>>()
+            .single(&world)
+            .unwrap();
+        assert_eq!(fragment.size(), UVec2::ONE);
+        assert_eq!(transform.translation, Vec3::X * 4.0);
+    }
+
+    #[test]
+    fn intact_dynamic_body_is_not_replaced() {
+        let mut grid = Grid::new(RuntimeShape::<u32, 2>::new([2, 1]));
+        grid.paint_cell(UVec2::ZERO, Some(()));
+        grid.paint_cell(UVec2::X, Some(()));
+        let mut scratch = Scratch::default();
+        initialize_scratch(grid.shape.usize(), &mut scratch);
+        let mut world = World::new();
+        let original = world.spawn(Sleeping::default()).id();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        solve(
+            &mut Commands::new(&mut queue, &world),
+            &mut grid,
+            &mut scratch,
+            0,
+            &ParentBody {
+                entity: original,
+                transform: GlobalTransform::IDENTITY,
+                velocity: Velocity::zero(),
+                center: None,
+                anchors_boundary: false,
+            },
+        );
+        queue.apply(&mut world);
+        assert_eq!(
+            world
+                .query_filtered::<Entity, With<ObjGrid>>()
+                .iter(&world)
+                .count(),
+            0,
+        );
+        assert!(world.get::<Sleeping>(original).is_some());
+        assert_eq!(grid.iter_set_positions().count(), 2);
     }
 
     #[test]

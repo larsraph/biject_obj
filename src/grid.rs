@@ -429,47 +429,19 @@ pub fn handle_grid_collisions(
         if !has_impulse {
             continue;
         }
-        let result = crate::simulation::solve(&mut grid, &mut scratch, 10, anchors.is_some());
-        for (grid, collider, velocity, offset) in result {
-            let object_transform = Transform {
-                translation: transform.transform_point(offset),
-                rotation: transform.rotation(),
-                ..default()
-            };
-            let solution = projection::solve(
-                &grid,
-                object_transform.rotation,
-                object_transform.translation.into(),
-            );
-            let center_offset = if let Some(parent_center) = com {
-                let fragment_center = collider.raw.mass_properties(1.0).local_com;
-                transform
-                    .affine()
-                    .transform_vector3(offset + fragment_center - parent_center)
-            } else {
-                Vec3::ZERO
-            };
-            let velocity = inherit_fragment_velocity(
-                parent_velocity,
-                center_offset,
-                object_transform.rotation,
-                velocity,
-            );
-            commands.spawn((
-                grid,
-                collider,
-                velocity,
-                object_transform,
-                RigidBody::Dynamic,
-                ObjGrid,
-                LockedAxes::TRANSLATION_LOCKED_Z
-                    | LockedAxes::ROTATION_LOCKED_X
-                    | LockedAxes::ROTATION_LOCKED_Y,
-                Bijection(solution),
-                ActiveEvents::COLLISION_EVENTS,
-                Sleeping::default(),
-            ));
-        }
+        crate::simulation::solve(
+            &mut commands,
+            &mut grid,
+            &mut scratch,
+            10,
+            &crate::simulation::ParentBody {
+                entity,
+                transform: *transform,
+                velocity: parent_velocity,
+                center: com,
+                anchors_boundary: anchors.is_some(),
+            },
+        );
     }
 }
 
@@ -479,7 +451,7 @@ fn contact_impulse(normal: Vec3, impulse: f32, grid_first: bool) -> Vec3 {
 }
 
 /// Adds the parent's world-space rigid motion to the fragment's local impulse response.
-fn inherit_fragment_velocity(
+pub(crate) fn inherit_fragment_velocity(
     parent: Velocity,
     center_offset: Vec3,
     rotation: Quat,
