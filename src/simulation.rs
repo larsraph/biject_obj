@@ -5,7 +5,7 @@ use ndshape::{RuntimeShape, Shape};
 
 use crate::{All as _, ToIVec2 as _, grid::Grid};
 
-const MAX_TRANSFER: f32 = 50.;
+const MAX_TRANSFER: f32 = 30.;
 
 #[derive(Default)]
 pub(crate) struct Scratch {
@@ -48,7 +48,7 @@ pub(crate) fn solve(
     iterations: usize,
     anchors_boundary: bool,
 ) -> impl Iterator<Item = (Grid, Collider, Velocity, Vec3)> {
-    equalize_velocity(iterations, grid, scratch);
+    relax(iterations, grid, scratch);
     break_bonds(scratch, grid);
     let mut blobs = Vec::new();
     extract_blobs(grid, scratch, anchors_boundary, &mut blobs);
@@ -119,7 +119,7 @@ fn build_blob(
     )
 }
 
-fn equalize_velocity(iterations: usize, grid: &Grid, scratch: &mut Scratch) {
+fn relax(iterations: usize, grid: &Grid, scratch: &mut Scratch) {
     // Iteratively equalize neighboring velocities.
     for _ in 0..iterations {
         // for every constraint try to equalize the velocities
