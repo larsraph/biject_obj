@@ -410,9 +410,8 @@ pub fn handle_grid_collisions(
                         continue;
                     }
                     has_impulse = true;
-                    let local_normal = local_from_world.transform_vector3(manifold.normal());
-                    let local_impulse =
-                        local_normal * impulse * if grid_first { 1.0 } else { -1.0 };
+                    let world_impulse = contact_impulse(manifold.normal(), impulse, grid_first);
+                    let local_impulse = local_from_world.transform_vector3(world_impulse);
                     let local_point = if grid_first {
                         point.local_p1()
                     } else {
@@ -474,6 +473,11 @@ pub fn handle_grid_collisions(
     }
 }
 
+// Rapier pushes collider 1 against the contact normal and collider 2 along it.
+fn contact_impulse(normal: Vec3, impulse: f32, grid_first: bool) -> Vec3 {
+    normal * impulse * if grid_first { -1.0 } else { 1.0 }
+}
+
 /// Adds the parent's world-space rigid motion to the fragment's local impulse response.
 fn inherit_fragment_velocity(
     parent: Velocity,
@@ -520,6 +524,74 @@ mod tests {
 
     fn grid(size: [u32; 2]) -> Grid {
         Grid::new(RuntimeShape::<u32, 2>::new(size))
+    }
+
+    #[test]
+    fn contact_impulse_matches_rapier_velocity_change() {
+        use bevy_rapier3d::rapier::prelude as rp;
+
+        for dynamic_first in [false, true] {
+            let mut bodies = rp::RigidBodySet::new();
+            let mut colliders = rp::ColliderSet::new();
+            let initial_velocity = Vec3::X * 10.0;
+            let dynamic = bodies.insert(
+                rp::RigidBodyBuilder::dynamic()
+                    .linvel(initial_velocity)
+                    .build(),
+            );
+            let mut handles = Vec::new();
+            for is_dynamic in [dynamic_first, !dynamic_first] {
+                let handle = if is_dynamic {
+                    colliders.insert_with_parent(
+                        rp::ColliderBuilder::ball(1.0).friction(0.0).build(),
+                        dynamic,
+                        &mut bodies,
+                    )
+                } else {
+                    colliders.insert(
+                        rp::ColliderBuilder::ball(1.0)
+                            .translation(Vec3::X * 1.9)
+                            .friction(0.0)
+                            .build(),
+                    )
+                };
+                handles.push(handle);
+            }
+            let dynamic_collider = handles[usize::from(!dynamic_first)];
+            let mass = colliders[dynamic_collider].mass_properties().mass();
+            let mut narrow_phase = rp::NarrowPhase::new();
+            rp::PhysicsPipeline::new().step(
+                Vec3::ZERO,
+                &rp::IntegrationParameters::default(),
+                &mut rp::IslandManager::new(),
+                &mut rp::BroadPhaseBvh::new(),
+                &mut narrow_phase,
+                &mut bodies,
+                &mut colliders,
+                &mut rp::ImpulseJointSet::new(),
+                &mut rp::MultibodyJointSet::new(),
+                &mut rp::CCDSolver::new(),
+                &(),
+                &(),
+            );
+            let pair = narrow_phase.contact_pair(handles[0], handles[1]).unwrap();
+            let mut reconstructed = Vec3::ZERO;
+            for manifold in &pair.manifolds {
+                for point in &manifold.points {
+                    reconstructed += contact_impulse(
+                        manifold.data.normal,
+                        point.data.impulse,
+                        pair.collider1 == dynamic_collider,
+                    );
+                }
+            }
+            let measured = (bodies[dynamic].linvel() - initial_velocity) * mass;
+            assert!(measured.x < 0.0, "collision must slow the approaching body");
+            assert!(
+                (reconstructed - measured).length() < 1e-3,
+                "reconstructed {reconstructed:?}, measured {measured:?}",
+            );
+        }
     }
 
     #[test]
