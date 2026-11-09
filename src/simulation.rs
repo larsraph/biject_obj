@@ -10,19 +10,19 @@ const MAX_TRANSFER: f32 = 50.;
 #[derive(Default)]
 pub(crate) struct Scratch {
     // Velocity per cell.
-    cell: Vec<Vec2>,
+    cell_velocity: Vec<Vec2>,
     // Accumulated velocity transfer across the east and north faces.
     face: Vec<[Vec2; 2]>,
-    visited: BitVec,
+    cell_visited: BitVec,
 }
 
-pub(crate) fn initialize_scratch(grid: &Grid, scratch: &mut Scratch) {
-    scratch.cell.clear();
+pub(crate) fn initialize_scratch(size: usize, scratch: &mut Scratch) {
+    scratch.cell_velocity.clear();
     scratch.face.clear();
-    scratch.visited.clear();
-    scratch.cell.resize(grid.shape.usize(), Vec2::ZERO);
-    scratch.face.resize(grid.shape.usize(), [Vec2::ZERO; 2]);
-    scratch.visited.resize(grid.shape.usize(), false);
+    scratch.cell_visited.clear();
+    scratch.cell_velocity.resize(size, Vec2::ZERO);
+    scratch.face.resize(size, [Vec2::ZERO; 2]);
+    scratch.cell_visited.resize(size, false);
 }
 
 pub(crate) fn add_impulse(grid: &Grid, scratch: &mut Scratch, impulse: Vec2, pos: Vec2) {
@@ -38,7 +38,7 @@ pub(crate) fn add_impulse(grid: &Grid, scratch: &mut Scratch, impulse: Vec2, pos
     let Some(idx) = grid.linearize_checked(pos) else {
         return;
     };
-    scratch.cell[idx] += impulse;
+    scratch.cell_velocity[idx] += impulse;
 }
 
 // TODO: Re-extract unsupported components after editing.
@@ -75,8 +75,8 @@ pub(crate) fn solve(
                     let a_idx = grid.linearize(a);
                     let b_idx = grid.linearize(b);
 
-                    let vel_a = scratch.cell[a_idx];
-                    let vel_b = scratch.cell[b_idx];
+                    let vel_a = scratch.cell_velocity[a_idx];
+                    let vel_b = scratch.cell_velocity[b_idx];
 
                     let quadrant = if is_y {
                         CompassQuadrant::North
@@ -88,8 +88,8 @@ pub(crate) fn solve(
                     if dot > 0. {
                         // completely sticky/rigid collision
                         let half_diff = (vel_a - vel_b) / 2.;
-                        scratch.cell[a_idx] -= half_diff;
-                        scratch.cell[b_idx] += half_diff;
+                        scratch.cell_velocity[a_idx] -= half_diff;
+                        scratch.cell_velocity[b_idx] += half_diff;
                         scratch.face[a_idx][is_y as usize] += half_diff;
                     } else if grid.get_edge(pos, quadrant) {
                         // pulled apart has a cap and requires connection
@@ -102,8 +102,8 @@ pub(crate) fn solve(
                             max_b_len_d(*transferred, half_diff, MAX_TRANSFER) * half_diff
                         };
 
-                        scratch.cell[a_idx] -= maxed_diff;
-                        scratch.cell[b_idx] += maxed_diff;
+                        scratch.cell_velocity[a_idx] -= maxed_diff;
+                        scratch.cell_velocity[b_idx] += maxed_diff;
                         scratch.face[a_idx][is_y as usize] += maxed_diff;
                     }
                 }
@@ -135,13 +135,16 @@ pub(crate) fn solve(
         for x in 0..x_size {
             let pos = UVec2::new(x, y);
             let idx = grid.shape.linearize(pos) as usize;
-            if !scratch.visited[idx]
+            if !scratch.cell_visited[idx]
                 && grid[pos].is_some()
-                && scratch.cell[idx].abs().cmpge(Vec2::splat(1e-5)).any()
+                && scratch.cell_velocity[idx]
+                    .abs()
+                    .cmpge(Vec2::splat(1e-5))
+                    .any()
             {
                 let mut blob_vec = Vec::new();
                 let mut pending = vec![pos];
-                scratch.visited.set(idx, true);
+                scratch.cell_visited.set(idx, true);
                 let mut touches_boundary = false;
                 while let Some(cell) = pending.pop() {
                     blob_vec.push(cell.as_ivec2().extend(0));
@@ -149,11 +152,11 @@ pub(crate) fn solve(
                     for &dir in CompassQuadrant::ALL {
                         let target = cell.wrapping_add_signed(dir.ivec2());
                         if let Some(index) = grid.linearize_checked(target)
-                            && !scratch.visited[index]
+                            && !scratch.cell_visited[index]
                             && grid[target].is_some()
                             && grid.get_edge(cell, dir)
                         {
-                            scratch.visited.set(index, true);
+                            scratch.cell_visited.set(index, true);
                             pending.push(target);
                         }
                     }
@@ -221,7 +224,7 @@ pub(crate) fn solve(
                 let pos = UVec2::new(x, y);
                 if blob_grid.get(pos).is_some() {
                     let idx = source_shape.linearize(pos + origin) as usize;
-                    let velocity = scratch.cell[idx].extend(0.0);
+                    let velocity = scratch.cell_velocity[idx].extend(0.0);
                     // `Collider::voxels` interprets an integer coordinate as the
                     // voxel's lower corner, so use its center for the moment arm.
                     let cell_center = (pos.as_vec2() + Vec2::splat(0.5)).extend(0.5);
@@ -283,7 +286,7 @@ mod tests {
             grid.paint_cell(pos, Some(()));
         }
         let mut scratch = Scratch::default();
-        initialize_scratch(&grid, &mut scratch);
+        initialize_scratch(grid.shape.usize(), &mut scratch);
         add_impulse(&grid, &mut scratch, Vec2::Y, Vec2::new(3.0, 4.0));
         add_impulse(&grid, &mut scratch, Vec2::Y, Vec2::new(4.0, 4.0));
         let blobs: Vec<_> = solve(&mut grid, &mut scratch, 0, true).collect();
@@ -307,7 +310,7 @@ mod tests {
             let mut grid = Grid::new(RuntimeShape::<u32, 2>::new([5, 5]));
             grid.paint_cell(pos, Some(()));
             let mut scratch = Scratch::default();
-            initialize_scratch(&grid, &mut scratch);
+            initialize_scratch(grid.shape.usize(), &mut scratch);
             add_impulse(&grid, &mut scratch, Vec2::Y, pos.as_vec2());
             assert_eq!(solve(&mut grid, &mut scratch, 0, true).count(), 0);
             assert!(grid[pos].is_some());
@@ -319,10 +322,10 @@ mod tests {
         let mut grid = Grid::new(RuntimeShape::<u32, 2>::new([256, 256]));
         grid.set_brush(Vec2::splat(128.0), 128, Some(()));
         let mut scratch = Scratch::default();
-        initialize_scratch(&grid, &mut scratch);
+        initialize_scratch(grid.shape.usize(), &mut scratch);
         add_impulse(&grid, &mut scratch, Vec2::Y, Vec2::ZERO);
         assert_eq!(solve(&mut grid, &mut scratch, 0, true).count(), 0);
-        assert!(scratch.visited.all());
+        assert!(scratch.cell_visited.all());
     }
 
     #[test]

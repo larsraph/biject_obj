@@ -409,7 +409,7 @@ pub fn handle_grid_collisions(
             Vec3::ZERO
         };
 
-        crate::simulation::initialize_scratch(&grid, &mut scratch);
+        crate::simulation::initialize_scratch(grid.shape.usize(), &mut scratch);
         let mut has_impulse = false;
         for other in others {
             let Some(contact_pair) = rapier_context.contact_pair(*base, *other) else {
