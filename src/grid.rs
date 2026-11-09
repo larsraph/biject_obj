@@ -22,7 +22,7 @@ pub struct WorldGrid;
 #[derive(Component)]
 pub struct ObjGrid;
 
-const BOUNDARY_THICKNESS: f32 = 1.0;
+const BOUNDARY_THICKNESS: f32 = 16.0;
 
 #[derive(Component, Debug)]
 pub struct Grid {
