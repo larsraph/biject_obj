@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 bevy_rapier3d = { version = "0.35.0", default-features = false, features = ["dim3"] }
-bevy = { version = "0.19.1", default-features = false, features = ["2d", "ui", "audio", "dynamic_linking", "debug"] }
+bevy = { version = "0.19.1", default-features = false, features = ["2d", "ui", "audio", "debug"] }
 bitvec = "1.1.1"
 ndshape = { git = "https://github.com/larsraph/ndshape-rs" }
 rand = "0.10.2"
@@ -16,3 +16,7 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[features]
+default_features = ["dyn"]
+dyn = ["bevy/dynamic_linking"]
