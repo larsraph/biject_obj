@@ -338,7 +338,7 @@ fn extract_blobs_to_one(
         for cell in &mut positions {
             *cell -= min.extend(0);
         }
-        let (grid, collider, relative_velocity, offset) =
+        let (mut grid, collider, relative_velocity, offset) =
             build_blob(positions, origin, blob_grid, source_shape, scratch);
         let object_transform = Transform {
             translation: parent.transform.transform_point(offset),
@@ -363,6 +363,7 @@ fn extract_blobs_to_one(
             object_transform.rotation,
             relative_velocity,
         );
+        grid.mark_collider_clean();
         commands.spawn((
             grid,
             collider,
@@ -384,10 +385,12 @@ fn extract_blobs_to_one(
         // Only its occupied geometry needs rebuilding before the next step.
         if let Some(collider) = grid.build_collider() {
             commands.entity(parent.entity).insert(collider);
+            grid.mark_collider_clean();
         } else if !parent.anchors_boundary {
             commands.entity(parent.entity).despawn();
         } else {
             commands.entity(parent.entity).remove::<Collider>();
+            grid.mark_collider_clean();
         }
     }
 }

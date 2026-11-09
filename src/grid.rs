@@ -26,7 +26,8 @@ const BOUNDARY_THICKNESS: f32 = 1.0;
 
 #[derive(Component, Debug)]
 pub struct Grid {
-    pub values: Box<[Cell]>,
+    values: Box<[Cell]>,
+    collider_dirty: bool,
     pub edges: BitBox,
     pub shape: RuntimeShape<u32, 2>,
 }
@@ -35,6 +36,7 @@ impl Grid {
     pub fn new(shape: RuntimeShape<u32, 2>) -> Self {
         Self {
             values: vec![None; shape.usize()].into_boxed_slice(),
+            collider_dirty: true,
             edges: bitbox!(0; 2 * shape.usize()),
             shape,
         }
@@ -88,6 +90,8 @@ impl Grid {
     #[track_caller]
     pub fn get_mut(&mut self, pos: UVec2) -> &mut Cell {
         let index = self.linearize_expect(pos);
+        // Raw mutable access may change occupancy. Bond-only edits use set_edge.
+        self.collider_dirty = true;
         &mut self.values[index]
     }
 
@@ -110,6 +114,7 @@ impl Grid {
             return;
         };
 
+        self.collider_dirty |= self.values[index].is_some() != to.is_some();
         self.values[index] = to;
 
         for &quadrant in CompassQuadrant::ALL {
@@ -247,6 +252,10 @@ impl Grid {
         self.disconnect_rect(rect);
         self.clear_rect(rect);
         Some(grid)
+    }
+
+    pub(crate) fn mark_collider_clean(&mut self) {
+        self.collider_dirty = false;
     }
 
     pub fn build_collider(&self) -> Option<Collider> {
@@ -445,7 +454,8 @@ pub fn handle_grid_collisions(
     }
 }
 
-// Rapier pushes collider 1 against the contact normal and collider 2 along it.
+// Rapier's normal points from collider 1 toward collider 2. The contact
+// impulse pushes collider 1 against that normal and collider 2 along it.
 fn contact_impulse(normal: Vec3, impulse: f32, grid_first: bool) -> Vec3 {
     normal * impulse * if grid_first { -1.0 } else { 1.0 }
 }
@@ -465,9 +475,12 @@ pub(crate) fn inherit_fragment_velocity(
 
 pub fn update_colliders(
     mut commands: Commands,
-    mut query: Query<(Entity, &Grid, Option<&mut Collider>), Changed<Grid>>,
+    mut query: Query<(Entity, &mut Grid, Option<&mut Collider>), Changed<Grid>>,
 ) {
-    for (entity, grid, collider) in query.iter_mut() {
+    for (entity, mut grid, collider) in query.iter_mut() {
+        if !grid.collider_dirty {
+            continue;
+        }
         match (collider, grid.build_collider()) {
             (Some(mut old), Some(new)) => *old = new,
             (Some(_), None) => {
@@ -478,6 +491,7 @@ pub fn update_colliders(
             }
             (None, None) => {}
         }
+        grid.mark_collider_clean();
     }
 }
 
@@ -496,6 +510,63 @@ mod tests {
 
     fn grid(size: [u32; 2]) -> Grid {
         Grid::new(RuntimeShape::<u32, 2>::new(size))
+    }
+
+    #[test]
+    fn colliders_rebuild_only_when_occupancy_is_dirty() {
+        #[derive(Resource, Default)]
+        struct ColliderChanges(usize);
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<ColliderChanges>()
+            .add_systems(
+                Update,
+                (
+                    update_colliders,
+                    |colliders: Query<Entity, Changed<Collider>>,
+                     mut changes: ResMut<ColliderChanges>| {
+                        changes.0 += colliders.iter().count();
+                    },
+                )
+                    .chain(),
+            );
+        let mut cells = grid([2, 1]);
+        cells.paint_cell(UVec2::ZERO, Some(()));
+        cells.paint_cell(UVec2::X, Some(()));
+        let entity = app.world_mut().spawn(cells).id();
+        app.update();
+        assert_eq!(app.world().resource::<ColliderChanges>().0, 1);
+
+        // A simulation borrow and a broken bond must not replace geometry.
+        {
+            let mut cells = app.world_mut().get_mut::<Grid>(entity).unwrap();
+            let _: &mut Grid = &mut cells;
+            cells.set_edge(UVec2::ZERO, CompassQuadrant::East, false);
+            cells.paint_cell(UVec2::ZERO, Some(()));
+        }
+        app.update();
+        assert_eq!(app.world().resource::<ColliderChanges>().0, 1);
+
+        app.world_mut()
+            .get_mut::<Grid>(entity)
+            .unwrap()
+            .paint_cell(UVec2::X, None);
+        app.update();
+        assert_eq!(app.world().resource::<ColliderChanges>().0, 2);
+        app.update();
+        assert_eq!(app.world().resource::<ColliderChanges>().0, 2);
+
+        app.world_mut()
+            .get_mut::<Grid>(entity)
+            .unwrap()
+            .paint_cell(UVec2::ZERO, None);
+        app.update();
+        assert!(app.world().get::<Collider>(entity).is_none());
+        app.world_mut().get_mut::<Grid>(entity).unwrap()[UVec2::ZERO] = Some(());
+        app.update();
+        assert!(app.world().get::<Collider>(entity).is_some());
+        assert_eq!(app.world().resource::<ColliderChanges>().0, 3);
     }
 
     #[test]
