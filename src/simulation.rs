@@ -68,7 +68,10 @@ pub(crate) fn solve(
     parent: &ParentBody,
 ) {
     relax(iterations, grid, scratch);
-    if break_bonds(scratch, grid) {
+    let bonds_broken = break_bonds(scratch, grid);
+    // A repossessed component may already be disconnected from the terrain.
+    // Its first contact must reactivate it without requiring another fracture.
+    if bonds_broken || parent.anchors_boundary {
         let mut blobs = Vec::new();
         find_blobs(grid, scratch, &mut blobs, parent.anchors_boundary);
         extract_blobs_to_one(commands, parent, blobs, scratch, grid);
@@ -242,7 +245,10 @@ fn find_blobs(grid: &Grid, scratch: &mut Scratch, blobs: &mut Vec<Blob>, anchors
         for x in 0..x_size {
             let pos = UVec2::new(x, y);
             let idx = grid.shape.linearize(pos) as usize;
-            if !scratch.cell_visited[idx] && grid[pos].is_some() {
+            if !scratch.cell_visited[idx]
+                && grid[pos].is_some()
+                && (!anchors_boundary || scratch.cell_velocity[idx] != Vec2::ZERO)
+            {
                 let mut min = IVec2::MAX;
                 let mut max = IVec2::MIN;
                 let mut positions = Vec::new();
@@ -542,6 +548,50 @@ mod tests {
             .unwrap();
         assert_eq!(fragment.size(), UVec2::ONE);
         assert_eq!(transform.translation, Vec3::X * 4.0);
+    }
+
+    #[test]
+    fn first_hit_reactivates_disconnected_world_component_without_breaking_bonds() {
+        let mut grid = Grid::new(RuntimeShape::<u32, 2>::new([8, 8]));
+        // Hit component, untouched component, and anchored terrain.
+        for pos in [
+            UVec2::new(3, 4),
+            UVec2::new(4, 4),
+            UVec2::new(6, 6),
+            UVec2::new(0, 1),
+        ] {
+            grid.paint_cell(pos, Some(()));
+        }
+        let mut scratch = Scratch::default();
+        initialize_scratch(grid.shape.usize(), &mut scratch);
+        add_impulse(&grid, &mut scratch, Vec2::Y, Vec2::new(3.0, 4.0));
+        add_impulse(&grid, &mut scratch, Vec2::Y, Vec2::new(0.0, 1.0));
+        let mut world = World::new();
+        let entity = world.spawn_empty().id();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        solve(
+            &mut Commands::new(&mut queue, &world),
+            &mut grid,
+            &mut scratch,
+            10,
+            &ParentBody {
+                entity,
+                transform: GlobalTransform::IDENTITY,
+                velocity: Velocity::zero(),
+                center: None,
+                anchors_boundary: true,
+            },
+        );
+        queue.apply(&mut world);
+        let fragment = world
+            .query_filtered::<&Grid, With<ObjGrid>>()
+            .single(&world)
+            .unwrap();
+        assert_eq!(fragment.size(), UVec2::new(2, 1));
+        assert!(fragment.get_edge(UVec2::ZERO, CompassQuadrant::East));
+        assert!(grid[UVec2::new(3, 4)].is_none());
+        assert!(grid[UVec2::new(6, 6)].is_some());
+        assert!(grid[UVec2::new(0, 1)].is_some());
     }
 
     #[test]
