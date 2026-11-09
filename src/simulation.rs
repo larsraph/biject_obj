@@ -1,7 +1,7 @@
 use bevy::{math::CompassQuadrant, prelude::*};
 use bevy_rapier3d::prelude::*;
 use bitvec::vec::BitVec;
-use ndshape::Shape;
+use ndshape::{RuntimeShape, Shape};
 
 use crate::{All as _, ToIVec2 as _, grid::Grid};
 
@@ -45,11 +45,83 @@ pub(crate) fn add_impulse(grid: &Grid, scratch: &mut Scratch, impulse: Vec2, pos
 pub(crate) fn solve(
     grid: &mut Grid,
     scratch: &mut Scratch,
-    n: usize,
+    iterations: usize,
     anchors_boundary: bool,
 ) -> impl Iterator<Item = (Grid, Collider, Velocity, Vec3)> {
+    equalize_velocity(iterations, grid, scratch);
+    break_bonds(scratch, grid);
+    let mut blobs = Vec::new();
+    extract_blobs(grid, scratch, anchors_boundary, &mut blobs);
+
+    let source_shape = grid.shape;
+    blobs.into_iter().map(move |(cells, origin, blob_grid)| {
+        build_blob(cells, origin, blob_grid, source_shape, scratch)
+    })
+}
+
+// Accumulate angular and linear momentum in each blob's local frame.
+fn build_blob(
+    cells: Vec<IVec3>,
+    origin: UVec2,
+    blob_grid: Grid,
+    source_shape: RuntimeShape<u32, 2>,
+    scratch: &Scratch,
+) -> (Grid, Collider, Velocity, Vec3) {
+    let collider = Collider::voxels(Vec3::ONE, &cells);
+    // A unit voxel with density one has unit mass. Its center is at its
+    // integer grid coordinate plus (0.5, 0.5, 0.5), which matches Rapier's
+    // voxel convention and the former Avian calculation.
+    let mass = cells.len() as f32;
+    let cell_mass = 1.0;
+    let center_of_mass = cells
+        .iter()
+        .map(|cell| cell.as_vec3() + Vec3::splat(0.5))
+        .sum::<Vec3>()
+        / mass;
+    let mut angular_momentum = Vec3::ZERO;
+    let mut linear_momentum = Vec3::ZERO;
+    let [x, y] = blob_grid.shape.as_array();
+    for y in 0..y {
+        for x in 0..x {
+            let pos = UVec2::new(x, y);
+            if blob_grid.get(pos).is_some() {
+                let idx = source_shape.linearize(pos + origin) as usize;
+                let velocity = scratch.cell_velocity[idx].extend(0.0);
+                // `Collider::voxels` interprets an integer coordinate as the
+                // voxel's lower corner, so use its center for the moment arm.
+                let cell_center = (pos.as_vec2() + Vec2::splat(0.5)).extend(0.5);
+                let cell_momentum = cell_mass * velocity;
+
+                linear_momentum += cell_momentum;
+                angular_momentum += (cell_center - center_of_mass).cross(cell_momentum);
+            }
+        }
+    }
+
+    let linear_velocity = linear_momentum / mass;
+    // All voxels lie in the XY plane, so only rotation about Z is relevant.
+    let principal_angular_inertia_z = cells.iter().fold(0.0, |inertia, cell| {
+        let center = cell.as_vec3() + Vec3::splat(0.5);
+        // The moment of inertia of a unit-mass unit cube about Z through its
+        // center is 1/6; add the parallel-axis contribution for the blob.
+        inertia + 1.0 / 6.0 + (center - center_of_mass).truncate().length_squared()
+    });
+    let angular_velocity = Vec3::Z * (angular_momentum.z / principal_angular_inertia_z);
+
+    (
+        blob_grid,
+        collider,
+        Velocity {
+            linear: linear_velocity,
+            angular: angular_velocity,
+        },
+        origin.as_vec2().extend(0.),
+    )
+}
+
+fn equalize_velocity(iterations: usize, grid: &Grid, scratch: &mut Scratch) {
     // Iteratively equalize neighboring velocities.
-    for _ in 0..n {
+    for _ in 0..iterations {
         // for every constraint try to equalize the velocities
         let [x_range, y_range] = grid.shape.as_array();
         for y in 0..y_range {
@@ -110,7 +182,9 @@ pub(crate) fn solve(
             }
         }
     }
+}
 
+fn break_bonds(scratch: &mut Scratch, grid: &mut Grid) {
     // Break bonds whose accumulated transfer reaches the limit.
     for (idx, [x, y]) in scratch.face.iter().enumerate() {
         if x.length() >= MAX_TRANSFER - 1e-6 {
@@ -120,15 +194,14 @@ pub(crate) fn solve(
             grid.edges.set(idx * 2 + 1, false);
         }
     }
+}
 
-    fn is_boundary(pos: UVec2, size: UVec2) -> bool {
-        pos.cmpeq(UVec2::ZERO).any() || (pos + UVec2::ONE).cmpeq(size).any()
-    }
-
-    // Extract moving connected components that are not anchored to the boundary.
-
-    // for non-boundaried blobs we sample a random blob as the base blob which doesn't need to be extracted
-    let mut blobs = Vec::new();
+fn extract_blobs(
+    grid: &mut Grid,
+    scratch: &mut Scratch,
+    anchors_boundary: bool,
+    blobs: &mut Vec<(Vec<IVec3>, UVec2, Grid)>,
+) {
     let [x_size, y_size] = grid.shape.as_array();
     let size = UVec2::new(x_size, y_size);
     for y in 0..y_size {
@@ -142,12 +215,12 @@ pub(crate) fn solve(
                     .cmpge(Vec2::splat(1e-5))
                     .any()
             {
-                let mut blob_vec = Vec::new();
+                let mut positions = Vec::new();
                 let mut pending = vec![pos];
                 scratch.cell_visited.set(idx, true);
                 let mut touches_boundary = false;
                 while let Some(cell) = pending.pop() {
-                    blob_vec.push(cell.as_ivec2().extend(0));
+                    positions.push(cell.as_ivec2().extend(0));
                     touches_boundary |= anchors_boundary && is_boundary(cell, size);
                     for &dir in CompassQuadrant::ALL {
                         let target = cell.wrapping_add_signed(dir.ivec2());
@@ -165,16 +238,14 @@ pub(crate) fn solve(
                 if !touches_boundary {
                     let mut blob_grid = Grid::new(grid.shape);
 
-                    // Copy occupancy and every internal bond before removing
-                    // the component. The old traversal copied only its spanning
-                    // tree, which silently fractured cycles in the new object.
-                    for cell in &blob_vec {
+                    for cell in &positions {
                         let pos = cell.truncate().as_uvec2();
                         blob_grid[pos] = grid[pos];
                     }
-                    for cell in &blob_vec {
+
+                    for cell in &positions {
                         let pos = cell.truncate().as_uvec2();
-                        for dir in [CompassQuadrant::North, CompassQuadrant::East] {
+                        for &dir in CompassQuadrant::ALL {
                             let neighbor = pos.wrapping_add_signed(dir.ivec2());
                             if blob_grid.contains(neighbor)
                                 && blob_grid[neighbor].is_some()
@@ -184,78 +255,24 @@ pub(crate) fn solve(
                             }
                         }
                     }
-                    for cell in &blob_vec {
-                        grid.paint_cell(cell.truncate().as_uvec2(), None);
+                    for cell in &mut positions {
+                        let pos = cell.truncate().as_uvec2();
+                        grid.paint_cell(pos, None);
                     }
                     let Some((origin, blob_grid)) = blob_grid.shrink_to_fit() else {
-                        error!("How did it shrink to nothing? {:?}", blob_vec);
+                        error!("How did it shrink to nothing? {:?}", positions);
                         continue;
                     };
 
                     // TODO: see if this can be lazy
-                    for cell in &mut blob_vec {
+                    for cell in &mut positions {
                         *cell = cell.wrapping_sub_unsigned(origin.extend(0));
                     }
-                    blobs.push((blob_vec, origin, blob_grid));
+                    blobs.push((positions, origin, blob_grid));
                 }
             }
         }
     }
-
-    // Accumulate angular and linear momentum in each blob's local frame.
-    let source_shape = grid.shape;
-    blobs.into_iter().map(move |(cells, origin, blob_grid)| {
-        let collider = Collider::voxels(Vec3::ONE, &cells);
-        // A unit voxel with density one has unit mass. Its center is at its
-        // integer grid coordinate plus (0.5, 0.5, 0.5), which matches Rapier's
-        // voxel convention and the former Avian calculation.
-        let mass = cells.len() as f32;
-        let cell_mass = 1.0;
-        let center_of_mass = cells
-            .iter()
-            .map(|cell| cell.as_vec3() + Vec3::splat(0.5))
-            .sum::<Vec3>()
-            / mass;
-        let mut angular_momentum = Vec3::ZERO;
-        let mut linear_momentum = Vec3::ZERO;
-        let [x, y] = blob_grid.shape.as_array();
-        for y in 0..y {
-            for x in 0..x {
-                let pos = UVec2::new(x, y);
-                if blob_grid.get(pos).is_some() {
-                    let idx = source_shape.linearize(pos + origin) as usize;
-                    let velocity = scratch.cell_velocity[idx].extend(0.0);
-                    // `Collider::voxels` interprets an integer coordinate as the
-                    // voxel's lower corner, so use its center for the moment arm.
-                    let cell_center = (pos.as_vec2() + Vec2::splat(0.5)).extend(0.5);
-                    let cell_momentum = cell_mass * velocity;
-
-                    linear_momentum += cell_momentum;
-                    angular_momentum += (cell_center - center_of_mass).cross(cell_momentum);
-                }
-            }
-        }
-
-        let linear_velocity = linear_momentum / mass;
-        // All voxels lie in the XY plane, so only rotation about Z is relevant.
-        let principal_angular_inertia_z = cells.iter().fold(0.0, |inertia, cell| {
-            let center = cell.as_vec3() + Vec3::splat(0.5);
-            // The moment of inertia of a unit-mass unit cube about Z through its
-            // center is 1/6; add the parallel-axis contribution for the blob.
-            inertia + 1.0 / 6.0 + (center - center_of_mass).truncate().length_squared()
-        });
-        let angular_velocity = Vec3::Z * (angular_momentum.z / principal_angular_inertia_z);
-
-        (
-            blob_grid,
-            collider,
-            Velocity {
-                linear: linear_velocity,
-                angular: angular_velocity,
-            },
-            origin.as_vec2().extend(0.),
-        )
-    })
 }
 
 // find c_max such that ||a + cb|| <= d
@@ -272,6 +289,10 @@ fn max_b_len_d(a: Vec2, b: Vec2, d: f32) -> f32 {
     let disc = (ab * ab - bb * (aa - d * d)).max(0.0);
 
     ((-ab + disc.sqrt()) / bb).clamp(0.0, 1.0)
+}
+
+fn is_boundary(pos: UVec2, size: UVec2) -> bool {
+    pos.cmpeq(UVec2::ZERO).any() || (pos + UVec2::ONE).cmpeq(size).any()
 }
 
 #[cfg(test)]
