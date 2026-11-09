@@ -185,13 +185,33 @@ fn equalize_velocity(iterations: usize, grid: &Grid, scratch: &mut Scratch) {
 }
 
 fn break_bonds(scratch: &mut Scratch, grid: &mut Grid) {
-    // Break bonds whose accumulated transfer reaches the limit.
-    for (idx, [x, y]) in scratch.face.iter().enumerate() {
-        if x.length() >= MAX_TRANSFER - 1e-6 {
-            grid.edges.set(idx * 2, false);
-        }
-        if y.length() >= MAX_TRANSFER - 1e-6 {
-            grid.edges.set(idx * 2 + 1, false);
+    // Break bonds whose accumulated transfer reaches the limit AND
+    // that are not aligned.
+    let [range_x, range_y] = grid.shape.as_array();
+    for y in 0..range_y {
+        for x in 0..range_x {
+            let pos = UVec2::new(x, y);
+            let c_idx = grid.linearize(pos);
+            let cell = scratch.cell_velocity[c_idx];
+            for (face, direction) in [CompassQuadrant::East, CompassQuadrant::North]
+                .into_iter()
+                .enumerate()
+            {
+                if !grid.get_edge(pos, direction) {
+                    continue;
+                }
+                let neighbor = pos.wrapping_add_signed(direction.ivec2());
+                let Some(other_idx) = grid.linearize_checked(neighbor) else {
+                    continue;
+                };
+                let transferred = scratch.face[c_idx][face];
+                let other_cell = scratch.cell_velocity[other_idx];
+                if transferred.length() >= MAX_TRANSFER - 1e-6
+                    && !aligned(cell, other_cell, direction == CompassQuadrant::North)
+                {
+                    grid.set_edge(pos, direction, false);
+                }
+            }
         }
     }
 }
@@ -355,6 +375,43 @@ mod tests {
         add_impulse(&grid, &mut scratch, Vec2::Y, Vec2::ZERO);
         assert_eq!(solve(&mut grid, &mut scratch, 0, true).count(), 0);
         assert!(scratch.cell_visited.all());
+    }
+
+    #[test]
+    fn breaking_selects_only_the_loaded_face_and_ignores_outer_faces() {
+        let shape = RuntimeShape::<u32, 2>::new([3, 2]);
+        for loaded_idx in 0..shape.usize() {
+            for loaded_face in 0..2 {
+                let mut grid = Grid::new(shape);
+                for y in 0..2 {
+                    for x in 0..3 {
+                        grid.paint_cell(UVec2::new(x, y), Some(()));
+                    }
+                }
+                let mut scratch = Scratch::default();
+                initialize_scratch(shape.usize(), &mut scratch);
+                scratch.face[loaded_idx][loaded_face] = Vec2::X * MAX_TRANSFER;
+                break_bonds(&mut scratch, &mut grid);
+
+                for y in 0..2 {
+                    for x in 0..3 {
+                        let pos = UVec2::new(x, y);
+                        for (face, direction) in [CompassQuadrant::East, CompassQuadrant::North]
+                            .into_iter()
+                            .enumerate()
+                        {
+                            let neighbor = pos.wrapping_add_signed(direction.ivec2());
+                            let loaded = grid.linearize(pos) == loaded_idx && face == loaded_face;
+                            assert_eq!(
+                                grid.get_edge(pos, direction),
+                                grid.contains(neighbor) && !loaded,
+                                "loaded cell {loaded_idx}, face {loaded_face}; checked {pos:?} {direction:?}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
