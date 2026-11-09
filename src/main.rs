@@ -1,5 +1,6 @@
 use bevy::{math::CompassQuadrant, prelude::*, transform::TransformSystems};
 use bevy_rapier3d::prelude::*;
+use ndshape::Shape;
 
 mod grid;
 mod input;
@@ -9,8 +10,8 @@ mod simulation;
 
 use crate::{
     grid::{
-        Collisions, handle_grid_collisions, on_world_grid_collision, recalculate_bijection,
-        spawn_edge_colliders, spawn_world_grid, update_colliders,
+        Bijection, Collisions, Grid, WorldGrid, handle_grid_collisions, on_world_grid_collision,
+        recalculate_bijection, spawn_edge_colliders, spawn_world_grid, update_colliders,
     },
     input::{
         Brush, MouseTarget, Selection, draw_selection, edit, move_mouse_rigid_body,
@@ -88,6 +89,31 @@ impl ToIVec2 for CompassQuadrant {
             CompassQuadrant::East => IVec2::X,
             CompassQuadrant::South => IVec2::NEG_Y,
             CompassQuadrant::West => IVec2::NEG_X,
+        }
+    }
+}
+
+fn repossess_sleeping(
+    mut commands: Commands,
+    world: Single<&mut Grid, With<WorldGrid>>,
+    query: Query<(Entity, &Grid, &Bijection, &Sleeping)>,
+) {
+    let mut world = world.into_inner();
+    for (entity, grid, bijection, sleeping) in query.iter() {
+        if sleeping.sleeping {
+            let [x_range, y_range] = grid.shape.as_array();
+            for y in 0..y_range {
+                for x in 0..x_range {
+                    let src = UVec2::new(x, y);
+                    let Some(dst) = bijection.0.src_to_dst(src) else {
+                        continue;
+                    };
+                    let dst = dst.as_uvec2();
+                    world[dst] = grid[src];
+                }
+            }
+            info!("repossessed");
+            commands.entity(entity).despawn();
         }
     }
 }
