@@ -173,30 +173,25 @@ fn relax(iterations: usize, grid: &Grid, scratch: &mut Scratch) {
                     let vel_a = scratch.cell_velocity[a_idx];
                     let vel_b = scratch.cell_velocity[b_idx];
 
-                    let aligned =
-                        aligned(vel_a, vel_b, matches!(direction, CompassQuadrant::North));
-
-                    // completely sticky/rigid collision
-                    if aligned {
-                        let half_diff = (vel_a - vel_b) / 2.;
-                        scratch.cell_velocity[a_idx] -= half_diff;
-                        scratch.cell_velocity[b_idx] += half_diff;
-                        scratch.face[a_idx][is_y as usize] += half_diff;
-                    } else if grid.get_edge(pos, direction) {
-                        // pulled apart has a cap and requires connection
-                        let transferred = &mut scratch.face[a_idx][is_y as usize];
-
-                        let half_diff = (vel_a - vel_b) / 2.;
-                        let maxed_diff = if half_diff == Vec2::ZERO {
-                            Vec2::ZERO
-                        } else {
-                            max_b_len_d(*transferred, half_diff, MAX_TRANSFER) * half_diff
-                        };
-
-                        scratch.cell_velocity[a_idx] -= maxed_diff;
-                        scratch.cell_velocity[b_idx] += maxed_diff;
-                        scratch.face[a_idx][is_y as usize] += maxed_diff;
+                    let normal = direction.ivec2().as_vec2();
+                    let approaching = (vel_b - vel_a).dot(normal) < 0.0;
+                    if !approaching && !grid.get_edge(pos, direction) {
+                        continue;
                     }
+
+                    let half_diff = (vel_a - vel_b) / 2.0;
+                    let transferred = &mut scratch.face[a_idx][is_y as usize];
+                    // Compression is unlimited, but still recorded so later
+                    // tension first cancels the accumulated compressive load.
+                    let fraction = if approaching {
+                        1.0
+                    } else {
+                        max_tensile_fraction(*transferred, half_diff, normal, MAX_TRANSFER)
+                    };
+                    let transfer = half_diff * fraction;
+                    scratch.cell_velocity[a_idx] -= transfer;
+                    scratch.cell_velocity[b_idx] += transfer;
+                    *transferred += transfer;
                 }
             }
         }
@@ -205,14 +200,11 @@ fn relax(iterations: usize, grid: &Grid, scratch: &mut Scratch) {
 
 fn break_bonds(scratch: &mut Scratch, grid: &mut Grid) -> bool {
     let mut any = false;
-    // Break bonds whose accumulated transfer reaches the limit AND
-    // that are not aligned.
     let [range_x, range_y] = grid.shape.as_array();
     for y in 0..range_y {
         for x in 0..range_x {
             let pos = UVec2::new(x, y);
             let c_idx = grid.linearize(pos);
-            let cell = scratch.cell_velocity[c_idx];
             for (face, direction) in [CompassQuadrant::East, CompassQuadrant::North]
                 .into_iter()
                 .enumerate()
@@ -220,17 +212,13 @@ fn break_bonds(scratch: &mut Scratch, grid: &mut Grid) -> bool {
                 if !grid.get_edge(pos, direction) {
                     continue;
                 }
-                let neighbor = pos.wrapping_add_signed(direction.ivec2());
-                let Some(other_idx) = grid.linearize_checked(neighbor) else {
-                    continue;
-                };
-                let transferred = scratch.face[c_idx][face];
-                let other_cell = scratch.cell_velocity[other_idx];
-                if transferred.length() >= MAX_TRANSFER - 1e-6
-                    && !aligned(cell, other_cell, direction == CompassQuadrant::North)
-                {
+                // Positive normal transfer is compression; only the negative
+                // normal component consumes this bond's tensile strength.
+                let normal = direction.ivec2().as_vec2();
+                let tension = (-scratch.face[c_idx][face].dot(normal)).max(0.0);
+                if tension >= MAX_TRANSFER - 1e-6 {
                     grid.set_edge(pos, direction, false);
-                    any |= true;
+                    any = true;
                 }
             }
         }
@@ -401,28 +389,14 @@ fn extract_blobs_to_one(
     }
 }
 
-fn aligned(vel_a: Vec2, vel_b: Vec2, is_y: bool) -> bool {
-    let vec = match is_y {
-        true => Vec2::Y,
-        false => Vec2::X,
-    };
-    (vel_b - vel_a).dot(vec) > 0.0
-}
-
-// find c_max such that ||a + cb|| <= d
-//
-// Solve the quadratic bound on the accumulated transfer.
-fn max_b_len_d(a: Vec2, b: Vec2, d: f32) -> f32 {
-    let aa = a.dot(a);
-    let ab = a.dot(b);
-    let bb = b.dot(b);
-
-    if bb == 0.0 {
+// Find the largest fraction of this transfer that keeps accumulated normal
+// tension within the limit. Compression and tangential transfer are unrestricted.
+fn max_tensile_fraction(accumulated: Vec2, requested: Vec2, normal: Vec2, limit: f32) -> f32 {
+    let normal_step = requested.dot(normal);
+    if normal_step >= 0.0 {
         return 1.0;
     }
-    let disc = (ab * ab - bb * (aa - d * d)).max(0.0);
-
-    ((-ab + disc.sqrt()) / bb).clamp(0.0, 1.0)
+    ((limit + accumulated.dot(normal)) / -normal_step).clamp(0.0, 1.0)
 }
 
 fn is_boundary(pos: UVec2, size: UVec2) -> bool {
@@ -642,7 +616,8 @@ mod tests {
                 }
                 let mut scratch = Scratch::default();
                 initialize_scratch(shape.usize(), &mut scratch);
-                scratch.face[loaded_idx][loaded_face] = Vec2::X * MAX_TRANSFER;
+                scratch.face[loaded_idx][loaded_face] =
+                    -if loaded_face == 0 { Vec2::X } else { Vec2::Y } * MAX_TRANSFER;
                 break_bonds(&mut scratch, &mut grid);
 
                 for y in 0..2 {
@@ -667,9 +642,127 @@ mod tests {
     }
 
     #[test]
-    fn transfer_limit_handles_zero_and_bounded_steps() {
-        assert_eq!(max_b_len_d(Vec2::ZERO, Vec2::ZERO, 1.0), 1.0);
-        let factor = max_b_len_d(Vec2::new(0.5, 0.0), Vec2::X, 1.0);
-        assert!((factor - 0.5).abs() < 1e-6);
+    fn compression_above_strength_equalizes_without_breaking() {
+        for normal in [UVec2::X, UVec2::Y] {
+            let mut grid = Grid::new(RuntimeShape::<u32, 2>::new(
+                (normal + UVec2::ONE).to_array(),
+            ));
+            grid.paint_cell(UVec2::ZERO, Some(()));
+            grid.paint_cell(normal, Some(()));
+            let mut scratch = Scratch::default();
+            initialize_scratch(grid.shape.usize(), &mut scratch);
+            let drift = Vec2::new(40.0, -15.0);
+            let a = grid.linearize(UVec2::ZERO);
+            let b = grid.linearize(normal);
+            scratch.cell_velocity[a] = drift + normal.as_vec2() * MAX_TRANSFER * 20.0;
+            scratch.cell_velocity[b] = drift;
+            relax(10, &grid, &mut scratch);
+            let expected = drift + normal.as_vec2() * MAX_TRANSFER * 10.0;
+            assert!((scratch.cell_velocity[a] - expected).length() < 1e-4);
+            assert!((scratch.cell_velocity[b] - expected).length() < 1e-4);
+            assert!(!break_bonds(&mut scratch, &mut grid));
+        }
+    }
+
+    #[test]
+    fn bottom_row_impact_does_not_fracture_a_compressed_block() {
+        let mut grid = Grid::new(RuntimeShape::<u32, 2>::new([4, 12]));
+        for y in 0..12 {
+            for x in 0..4 {
+                grid.paint_cell(UVec2::new(x, y), Some(()));
+            }
+        }
+        let mut scratch = Scratch::default();
+        initialize_scratch(grid.shape.usize(), &mut scratch);
+        for x in 0..4 {
+            add_impulse(
+                &grid,
+                &mut scratch,
+                Vec2::Y * MAX_TRANSFER * 100.0,
+                Vec2::new(x as f32 + 0.5, 0.5),
+            );
+        }
+        let momentum_before: Vec2 = scratch.cell_velocity.iter().sum();
+        let energy_before: f32 = scratch
+            .cell_velocity
+            .iter()
+            .map(|v| v.length_squared())
+            .sum();
+        relax(10, &grid, &mut scratch);
+        assert!(!break_bonds(&mut scratch, &mut grid));
+        let momentum_after: Vec2 = scratch.cell_velocity.iter().sum();
+        let energy_after: f32 = scratch
+            .cell_velocity
+            .iter()
+            .map(|v| v.length_squared())
+            .sum();
+        assert!((momentum_after - momentum_before).length() < 0.1);
+        assert!(energy_after <= energy_before);
+    }
+
+    #[test]
+    fn accumulated_compression_and_shear_do_not_break_a_bond() {
+        let mut grid = Grid::new(RuntimeShape::<u32, 2>::new([2, 1]));
+        grid.paint_cell(UVec2::ZERO, Some(()));
+        grid.paint_cell(UVec2::X, Some(()));
+        let mut scratch = Scratch::default();
+        initialize_scratch(grid.shape.usize(), &mut scratch);
+        scratch.face[0][0] = Vec2::new(MAX_TRANSFER * 100.0, MAX_TRANSFER * 100.0);
+        assert!(!break_bonds(&mut scratch, &mut grid));
+    }
+
+    #[test]
+    fn tensile_transfer_is_capped_and_breaks_the_bond() {
+        for normal in [UVec2::X, UVec2::Y] {
+            let mut grid = Grid::new(RuntimeShape::<u32, 2>::new(
+                (normal + UVec2::ONE).to_array(),
+            ));
+            grid.paint_cell(UVec2::ZERO, Some(()));
+            grid.paint_cell(normal, Some(()));
+            let mut scratch = Scratch::default();
+            initialize_scratch(grid.shape.usize(), &mut scratch);
+            let a = grid.linearize(UVec2::ZERO);
+            let b = grid.linearize(normal);
+            scratch.cell_velocity[a] = -normal.as_vec2() * MAX_TRANSFER * 20.0;
+            relax(10, &grid, &mut scratch);
+            assert_eq!(scratch.cell_velocity[b], -normal.as_vec2() * MAX_TRANSFER);
+            assert!(break_bonds(&mut scratch, &mut grid));
+        }
+    }
+
+    #[test]
+    fn bond_fracture_uses_accumulated_tension_even_after_velocities_equalize() {
+        let mut grid = Grid::new(RuntimeShape::<u32, 2>::new([2, 1]));
+        grid.paint_cell(UVec2::ZERO, Some(()));
+        grid.paint_cell(UVec2::X, Some(()));
+        let mut scratch = Scratch::default();
+        initialize_scratch(grid.shape.usize(), &mut scratch);
+        scratch.cell_velocity[0] = -Vec2::X * MAX_TRANSFER * 2.0;
+        relax(1, &grid, &mut scratch);
+        assert_eq!(scratch.cell_velocity[0], scratch.cell_velocity[1]);
+        assert!(break_bonds(&mut scratch, &mut grid));
+    }
+
+    #[test]
+    fn tensile_limit_accounts_for_prior_compression_and_ignores_shear() {
+        let normal = Vec2::X;
+        assert_eq!(
+            max_tensile_fraction(Vec2::ZERO, Vec2::ZERO, normal, 1.0),
+            1.0
+        );
+        assert_eq!(
+            max_tensile_fraction(Vec2::ZERO, Vec2::Y * 1000.0, normal, 1.0),
+            1.0
+        );
+        assert_eq!(
+            max_tensile_fraction(Vec2::X * 1000.0, Vec2::X, normal, 1.0),
+            1.0
+        );
+        let fraction = max_tensile_fraction(Vec2::X * 2.0, -Vec2::X * 4.0, normal, 1.0);
+        assert_eq!(fraction, 0.75);
+        assert_eq!(
+            max_tensile_fraction(-Vec2::X * 0.5, -Vec2::X, normal, 1.0),
+            0.5
+        );
     }
 }
